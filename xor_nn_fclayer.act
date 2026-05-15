@@ -1,0 +1,131 @@
+/* ================================================================
+  xor_nn_fclayer.act
+
+  XOR network built from the reusable fixed-point layer templates in
+  nn_layers.act.
+
+  Architecture:
+    x0, x1 -> FCLayer<2,2> -> Activation<step>
+           -> FCLayer<2,2> -> Activation<step>
+           -> xor_out, xnor_out
+
+  Expected truth table:
+    x0 x1 | xor_out | xnor_out
+     0  0 |   0     | 1
+     0  1 |   1     | 0
+     1  0 |   1     | 0
+     1  1 |   0     | 1
+ ================================================================ */
+
+import "nn_layers.act";
+
+
+/* ---------------------------------------------------------------
+  XOR_ANN
+---------------------------------------------------------------- */
+
+defproc XOR_ANN (chan?(math::fixpoint<8,8>) x0_in, x1_in;
+                   chan!(math::fixpoint<8,8>) xor_out, xnor_out)
+{
+  chan(math::fixpoint<8,8>) input_vec[2];
+  chan(math::fixpoint<8,8>) hidden_raw[2];
+  chan(math::fixpoint<8,8>) hidden_out[2];
+  chan(math::fixpoint<8,8>) output_raw[2];
+
+  input_vec[0] = x0_in;
+  input_vec[1] = x1_in;
+
+  // Hidden layer:
+  //   h0 = step(5*x0 + 5*x1 - 3)
+  //   h1 = step(5*x0 + 5*x1 - 8)
+  FCLayer<2, 2,
+          { 5.0, 5.0,
+            5.0, 5.0 },
+          { -3.0, -8.0 }> hidden_layer (input_vec, hidden_raw);
+
+  Activation<1, 0.0> hidden_act[2];
+  (h: 2:
+    hidden_act[h].in = hidden_raw[h];
+    hidden_act[h].out = hidden_out[h];
+  )
+
+  // Output layer:
+  //   xor_out  = step( 5*h0 - 5*h1 - 2)
+  //   xnor_out = step(-5*h0 + 5*h1 + 2)
+  FCLayer<2, 2,
+          {  5.0, -5.0,
+            -5.0,  5.0 },
+          { -2.0, 2.0 }> output_layer;
+  output_layer.x_in[0..1] = hidden_out[0..1];
+  output_layer.out[0..1] = output_raw[0..1];
+
+  Activation<1, 0.0> output_act[2];
+  output_act[0].in = output_raw[0];
+  output_act[0].out = xor_out;
+  output_act[1].in = output_raw[1];
+  output_act[1].out = xnor_out;
+}
+
+
+/* ---------------------------------------------------------------
+  XorTestbench
+---------------------------------------------------------------- */
+
+defproc XorTestbench (chan!(math::fixpoint<8,8>) x0, x1;
+                        chan?(math::fixpoint<8,8>) xor_out, xnor_out)
+{
+  math::fixpoint<8,8> zero, one, half, xv, nv, diff;
+  bool xb, nb;
+
+  chp {
+    zero.set(zero.const(0.0));
+    one.set(one.const(1.0));
+    half.set(half.const(0.5));
+
+    x0!zero; x1!zero;
+    xor_out?xv; xnor_out?nv;
+    diff := xv - half;
+    [ ~diff.negative() -> xb := true [] else -> xb := false ];
+    diff := nv - half;
+    [ ~diff.negative() -> nb := true [] else -> nb := false ];
+    log("xor(0,0) = ", xb);
+    log("xnor(0,0) = ", nb);
+
+    x0!zero; x1!one;
+    xor_out?xv; xnor_out?nv;
+    diff := xv - half;
+    [ ~diff.negative() -> xb := true [] else -> xb := false ];
+    diff := nv - half;
+    [ ~diff.negative() -> nb := true [] else -> nb := false ];
+    log("xor(0,1) = ", xb);
+    log("xnor(0,1) = ", nb);
+
+    x0!one; x1!zero;
+    xor_out?xv; xnor_out?nv;
+    diff := xv - half;
+    [ ~diff.negative() -> xb := true [] else -> xb := false ];
+    diff := nv - half;
+    [ ~diff.negative() -> nb := true [] else -> nb := false ];
+    log("xor(1,0) = ", xb);
+    log("xnor(1,0) = ", nb);
+
+    x0!one; x1!one;
+    xor_out?xv; xnor_out?nv;
+    diff := xv - half;
+    [ ~diff.negative() -> xb := true [] else -> xb := false ];
+    diff := nv - half;
+    [ ~diff.negative() -> nb := true [] else -> nb := false ];
+    log("xor(1,1) = ", xb);
+    log("xnor(1,1) = ", nb)
+  }
+}
+
+
+defproc test ()
+{
+  chan(math::fixpoint<8,8>) x0, x1;
+  chan(math::fixpoint<8,8>) xor_out, xnor_out;
+
+  XOR_ANN ann (x0, x1, xor_out, xnor_out);
+  XorTestbench tb (x0, x1, xor_out, xnor_out);
+}
