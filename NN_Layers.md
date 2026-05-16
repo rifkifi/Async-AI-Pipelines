@@ -3,28 +3,57 @@
 This document explains `nn_layers.act`, a reusable ACT layer library for
 fixed-point neural-network pipelines.
 
-All public layer ports use `math::fixpoint<8,8>` channels. Weights, biases, and
-the leaky-ReLU slope are passed as `preal` template parameters and converted to
-fixed-point values inside the process before the main CHP loop starts.
+All public data ports use `math::fixpoint<8,8>` channels. The library supports
+two different ways to provide layer parameters: compile-time template parameters and runtime channel parameters
 
 ## Layer Set
 
 `nn_layers.act` defines these reusable templates:
 
-| Template              | Role                                                                   |
-| --------------------- | ---------------------------------------------------------------------- |
-| `Activation`        | Standalone activation process                                          |
-| `WindowAssembler`   | Converts an image stream into sliding convolution windows              |
-| `WinFork`           | Copies one window to multiple convolution filters                      |
-| `ConvBank`          | Generic homogeneous convolution bank                                   |
-| `ConvLayer`         | Raw convolution layer wrapper                                          |
-| `ConvLayerAct`      | Convolution layer with inline activation                               |
-| `MaxPool2x2Ch`      | 2x2 max-pooling for one feature-map channel                            |
-| `MaxPool2x2`        | Multi-channel 2x2 max-pooling wrapper                                  |
-| `Flatten`           | Serializes feature-map channels into one flat stream                   |
-| `FlattenToParallel` | Flattens feature maps into parallel vector channels                    |
-| `FCLayer`           | Raw fully connected layer with parallel fixed-point inputs and outputs |
-| `FCLayerAct`        | Fully connected layer with inline activation                           |
+| Template                 | Role                                                                   |
+| ------------------------ | ---------------------------------------------------------------------- |
+| `Activation`           | Standalone activation process                                          |
+| `WindowAssembler`      | Converts an image stream into sliding convolution windows              |
+| `WinFork`              | Copies one window to multiple convolution filters                      |
+| `ConvBank`             | Generic homogeneous convolution bank                                   |
+| `ConvLayer`            | Raw convolution layer wrapper                                          |
+| `ConvLayerAct`         | Convolution layer with inline activation                               |
+| `MaxPool2x2Ch`         | 2x2 max-pooling for one feature-map channel                            |
+| `MaxPool2x2`           | Multi-channel 2x2 max-pooling wrapper                                  |
+| `Flatten`              | Serializes feature-map channels into one flat stream                   |
+| `FlattenToParallel`    | Flattens feature maps into parallel vector channels                    |
+| `FCLayer`              | Raw fully connected layer with parallel fixed-point inputs and outputs |
+| `FCLayerAct`           | Fully connected layer with inline activation                           |
+| `FCLayerParamSource`   | Sends one runtime dense-layer parameter set                            |
+| `FCLayerParam`         | Fully connected layer with weights and biases received over channels   |
+| `FCLayerActParam`      | Runtime-parameter fully connected layer with activation                |
+| `ConvLayerParamSource` | Sends one runtime convolution parameter set                            |
+| `ConvBankParam`        | Runtime-parameter convolution compute bank                             |
+| `ConvLayerParam`       | Convolution layer with weights and biases received over channels       |
+| `ConvLayerActParam`    | Runtime-parameter convolution layer with activation                    |
+
+## Parameter Input Styles
+
+`nn_layers.act` has two parallel families of layer templates.
+
+| Style                      | Templates                                                                        | How parameters enter                                           | When to use                                                                         |
+| -------------------------- | -------------------------------------------------------------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| Compile-time parameters    | `FCLayer`, `FCLayerAct`, `ConvLayer`, `ConvLayerAct`                     | `preal` template arrays such as `W` and `B`              | Parameters are known when writing/compiling the ACT file                            |
+| Runtime channel parameters | `FCLayerParam`, `FCLayerActParam`, `ConvLayerParam`, `ConvLayerActParam` | `math::fixpoint<8,8>` channels such as `w_in` and `b_in` | Parameters should come from another process, loader, memory interface, or testbench |
+
+The runtime channel-parameter layers still have fixed dimensions at compile
+time. For example, `FCLayerParam<8, 2>` always has 8 inputs and 2 outputs, but
+the 16 weights and 2 biases are received as channel tokens.
+
+Parameter-source helpers are included for examples and tests:
+
+| Source template          | Sends                           |
+| ------------------------ | ------------------------------- |
+| `FCLayerParamSource`   | One dense-layer weight/bias set |
+| `ConvLayerParamSource` | One convolution weight/bias set |
+
+These helpers are not required in a real system. Any process can drive the
+parameter channels as long as it sends values in the required order.
 
 ## `Activation`
 
@@ -625,3 +654,13 @@ FCLayerAct<2, 2, 1,
 
 `nn_layers.act` intentionally does not define a top-level `test` process.
 It is meant to be imported by network-specific files.
+
+
+# Possible Work
+
+* Create a test for each template to see the functional correctness of the process inside.
+* Evaluate asynchronous performance metrics: throughput, latency, handshake overhead, and pipeline bottlenecks.
+* Create a real CNN (can be with 3 input channels - RGB) or FC model in software and hardware (this chp template) and compare the result.
+* Generate a PRS or low level hardware implementations.
+* Add another activation functions (Softmax, tanh, etc).
+* Differently pipeline the process of neural network layers.
