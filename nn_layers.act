@@ -445,22 +445,22 @@ defproc ConvLayerAct (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH];
 
 
 /* ---------------------------------------------------------------
-  MaxPool2x2Ch<FEAT_W, FEAT_H>
+  MaxPoolCh<P, FEAT_W, FEAT_H>
 
-  2x2 max-pooling with stride 2 for one feature-map stream.
+  P x P max-pooling with stride P for one feature-map stream.
 ---------------------------------------------------------------- */
 
-template<pint FEAT_W, FEAT_H>
-defproc MaxPool2x2Ch (chan?(math::fixpoint<8,8>) in;
-                        chan!(math::fixpoint<8,8>) out)
+template<pint P, FEAT_W, FEAT_H>
+defproc MaxPoolCh (chan?(math::fixpoint<8,8>) in;
+                     chan!(math::fixpoint<8,8>) out)
 {
-  math::fixpoint<8,8> buf[2][FEAT_W], m, diff;
+  math::fixpoint<8,8> buf[P][FEAT_W], m, diff;
   int<16> col, row;
 
   chp {
     row := 0;
     *[ row < FEAT_H ->
-      (;r: 2:
+      (;r: P:
         (;c: FEAT_W:
           in?buf[r][c]
         )
@@ -470,22 +470,51 @@ defproc MaxPool2x2Ch (chan?(math::fixpoint<8,8>) in;
       *[ col < FEAT_W ->
         m := buf[0][col];
 
-        diff := buf[0][col+1] - m;
-        [ ~diff.negative() -> m := buf[0][col+1] [] else -> skip ];
-
-        diff := buf[1][col] - m;
-        [ ~diff.negative() -> m := buf[1][col] [] else -> skip ];
-
-        diff := buf[1][col+1] - m;
-        [ ~diff.negative() -> m := buf[1][col+1] [] else -> skip ];
+        (;pr: P:
+          (;pc: P:
+            diff := buf[pr][col+pc] - m;
+            [ ~diff.negative() -> m := buf[pr][col+pc] [] else -> skip ]
+          )
+        );
 
         out!m;
-        col := col + 2
+        col := col + P
       ];
 
-      row := row + 2
+      row := row + P
     ]
   }
+}
+
+
+/* ---------------------------------------------------------------
+  MaxPool<N_CH, FEAT_W, FEAT_H, P>
+---------------------------------------------------------------- */
+
+template<pint N_CH, FEAT_W, FEAT_H, P>
+defproc MaxPool (chan?(math::fixpoint<8,8>) feat_in[N_CH];
+                   chan!(math::fixpoint<8,8>) pool_out[N_CH])
+{
+  MaxPoolCh<P, FEAT_W, FEAT_H> pool_ch[N_CH];
+
+  (ch: N_CH:
+    pool_ch[ch].in = feat_in[ch];
+    pool_ch[ch].out = pool_out[ch];
+  )
+}
+
+
+/* ---------------------------------------------------------------
+  MaxPool2x2Ch<FEAT_W, FEAT_H>
+
+  2x2 max-pooling with stride 2 for one feature-map stream.
+---------------------------------------------------------------- */
+
+template<pint FEAT_W, FEAT_H>
+defproc MaxPool2x2Ch (chan?(math::fixpoint<8,8>) in;
+                        chan!(math::fixpoint<8,8>) out)
+{
+  MaxPoolCh<2, FEAT_W, FEAT_H> pool (.in = in, .out = out);
 }
 
 
@@ -497,12 +526,8 @@ template<pint N_CH, FEAT_W, FEAT_H>
 defproc MaxPool2x2 (chan?(math::fixpoint<8,8>) feat_in[N_CH];
                       chan!(math::fixpoint<8,8>) pool_out[N_CH])
 {
-  MaxPool2x2Ch<FEAT_W, FEAT_H> pool_ch[N_CH];
-
-  (ch: N_CH:
-    pool_ch[ch].in = feat_in[ch];
-    pool_ch[ch].out = pool_out[ch];
-  )
+  MaxPool<N_CH, FEAT_W, FEAT_H, 2> pool (.feat_in = feat_in,
+                                          .pool_out = pool_out);
 }
 
 

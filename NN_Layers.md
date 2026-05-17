@@ -18,8 +18,10 @@ two different ways to provide layer parameters: compile-time template parameters
 | `ConvBank`             | Generic homogeneous convolution bank                                   |
 | `ConvLayer`            | Raw convolution layer wrapper                                          |
 | `ConvLayerAct`         | Convolution layer with inline activation                               |
-| `MaxPool2x2Ch`         | 2x2 max-pooling for one feature-map channel                            |
-| `MaxPool2x2`           | Multi-channel 2x2 max-pooling wrapper                                  |
+| `MaxPoolCh`            | Parameterized PxP max-pooling for one feature-map channel              |
+| `MaxPool`              | Multi-channel parameterized PxP max-pooling wrapper                    |
+| `MaxPool2x2Ch`         | 2x2 max-pooling compatibility wrapper                                  |
+| `MaxPool2x2`           | Multi-channel 2x2 max-pooling compatibility wrapper                    |
 | `Flatten`              | Serializes feature-map channels into one flat stream                   |
 | `FlattenToParallel`    | Flattens feature maps into parallel vector channels                    |
 | `FCLayer`              | Raw fully connected layer with parallel fixed-point inputs and outputs |
@@ -369,13 +371,13 @@ linear, step, ReLU, or leaky ReLU. The difference is placement. In
 `ConvLayerAct`, activation is inside the convolution bank process. With
 `ConvLayer`, activation is a separate process after the raw convolution output.
 
-## `MaxPool2x2Ch` and `MaxPool2x2`
+## `MaxPoolCh`, `MaxPool`, and `MaxPool2x2`
 
-`MaxPool2x2Ch<FEAT_W, FEAT_H>` performs 2x2 max-pooling with stride 2 on one
-feature-map stream:
+`MaxPoolCh<P, FEAT_W, FEAT_H>` performs `P x P` max-pooling with stride `P`
+on one feature-map stream:
 
 ```act
-defproc MaxPool2x2Ch (chan?(math::fixpoint<8,8>) in;
+defproc MaxPoolCh (chan?(math::fixpoint<8,8>) in;
                         chan!(math::fixpoint<8,8>) out)
 ```
 
@@ -383,30 +385,31 @@ Parameters:
 
 | Parameter  | Meaning                                 |
 | ---------- | --------------------------------------- |
-| `FEAT_W` | Input feature-map width. Must be even.  |
-| `FEAT_H` | Input feature-map height. Must be even. |
+| `P`      | Pool window width and height. Also used as stride. |
+| `FEAT_W` | Input feature-map width. Must be divisible by `P`. |
+| `FEAT_H` | Input feature-map height. Must be divisible by `P`. |
 
 The pooled output size is:
 
 ```text
-POOL_W = FEAT_W / 2
-POOL_H = FEAT_H / 2
+POOL_W = FEAT_W / P
+POOL_H = FEAT_H / P
 ```
 
-It reads two full rows at a time, compares each 2x2 block, and emits the maximum.
-Because `math::fixpoint<8,8>` does not use plain integer comparison, the maximum
-test is implemented with subtraction:
+It reads `P` full rows at a time, compares each `P x P` block, and emits the
+maximum. Because `math::fixpoint<8,8>` does not use plain integer comparison,
+the maximum test is implemented with subtraction:
 
 ```act
 diff := candidate - m;
 [ ~diff.negative() -> m := candidate [] else -> skip ];
 ```
 
-`MaxPool2x2<N_CH, FEAT_W, FEAT_H>` creates one channel process per feature-map
-channel:
+`MaxPool<N_CH, FEAT_W, FEAT_H, P>` creates one pooling process per
+feature-map channel:
 
 ```act
-defproc MaxPool2x2 (chan?(math::fixpoint<8,8>) feat_in[N_CH];
+defproc MaxPool (chan?(math::fixpoint<8,8>) feat_in[N_CH];
                       chan!(math::fixpoint<8,8>) pool_out[N_CH])
 ```
 
@@ -417,8 +420,10 @@ Parameters:
 | `N_CH`   | Number of feature-map channels to pool independently. |
 | `FEAT_W` | Input feature-map width per channel.                  |
 | `FEAT_H` | Input feature-map height per channel.                 |
+| `P`      | Pool size and stride.                                 |
 
-`FEAT_W` and `FEAT_H` should be even.
+`MaxPool2x2Ch<FEAT_W, FEAT_H>` and `MaxPool2x2<N_CH, FEAT_W, FEAT_H>` are
+compatibility wrappers around the generic templates with `P = 2`.
 
 ## `Flatten` and `FlattenToParallel`
 
