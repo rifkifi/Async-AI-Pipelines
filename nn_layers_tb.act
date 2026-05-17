@@ -3,87 +3,47 @@
 
   Functional testbench for nn_layers.act.
 
-  Structure:
-    Each test instantiates a Source process, the DUT, and a Sink/Checker
-    process. Sources send fixed-point tokens; Checkers receive results,
-    compare to a golden reference (computed by hand or with Python/numpy),
-    and call prs_assert or log_bool to signal pass/fail.
-
-  Naming convention:
-    TB_<DUT>  – one top-level defproc per component under test.
-    All processes are composed in defproc Main.
-
-  Prerequisites:
-    The ACT standard library must supply:
-      math/fxp.act          (math::fixpoint<8,8>)
-      sim/chp.act  or similar for log_* / prs_assert
+  Each test instantiates a Source, the DUT, and a Sink/Checker.
+  Sources send fixed-point tokens; Checkers compare results to a
+  golden reference and emit a bool pass/fail on a channel.
+  Main collects all results and prints them with log().
   ================================================================ */
 
 import "math/fxp.act";
-import "sim/chp.act";           /* for log_bool / prs_assert if available */
 import "nn_layers.act";
 
 
-/* ----------------------------------------------------------------
-  Helper: tolerance check for fixed-point comparisons.
-  Returns true when |a - b| < eps.
----------------------------------------------------------------- */
-template<pint DUMMY>
-defproc FxpEq (chan?(math::fixpoint<8,8>) a, b;
-               chan!(bool) ok)
-{
-  math::fixpoint<8,8> va, vb, diff, eps, adiff;
-
-  chp {
-    eps.set(eps.const(0.02));   /* ~1 LSB in 8.8 */
-
-    *[
-      a?va; b?vb;
-      diff := va - vb;
-      [ ~diff.negative() -> adiff := diff
-      [] else             -> adiff := diff * adiff.const(-1.0)
-      ];
-      diff := eps - adiff;
-      ok!~diff.negative()
-    ]
-  }
-}
-
-
 /* ================================================================
-  1. Activation – all four modes
+  1.  Activation – all four modes
   ================================================================ */
 
-/* Source: sends a list of values one by one */
+/* ActSrc<N, V[]>: sends N fixed-point values from a preal array */
 template<pint N; preal V[N]>
 defproc ActSrc (chan!(math::fixpoint<8,8>) out)
 {
   math::fixpoint<8,8> v[N];
-
   chp {
     (;i: N: v[i].set(v[i].const(V[i])));
     (;i: N: out!v[i])
   }
 }
 
-/* Sink: receives N values and checks against expected */
+/* ActSink<N, EXP[]>: receives N values, checks each against EXP[i] */
 template<pint N; preal EXP[N]>
 defproc ActSink (chan?(math::fixpoint<8,8>) in; chan!(bool) pass)
 {
-  math::fixpoint<8,8> v, exp[N], diff, adiff, eps;
+  math::fixpoint<8,8> v, exp[N], eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
     (;i: N: exp[i].set(exp[i].const(EXP[i])));
-
     ok := true;
     (;i: N:
       in?v;
       diff := v - exp[i];
       [ ~diff.negative() -> adiff := diff
-      [] else             -> adiff := diff * adiff.const(-1.0)
-      ];
+      [] else             -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ]
     );
@@ -91,89 +51,57 @@ defproc ActSink (chan?(math::fixpoint<8,8>) in; chan!(bool) pass)
   }
 }
 
-/* --- 1a. Linear (ACT_FN=0) ---
-   inputs : -1, 0, 0.5, 2
-   expected: same
-*/
+/* 1a. Linear (ACT_FN=0): output == input */
 defproc TB_Act_Linear (chan!(bool) pass)
 {
-  preal INP[4] = {-1.0, 0.0, 0.5, 2.0};
-  preal EXP[4] = {-1.0, 0.0, 0.5, 2.0};
-
   chan(math::fixpoint<8,8>) c0, c1;
-
-  ActSrc<4, INP>    src (.out = c0);
-  Activation<0, 0.0> dut (.in = c0, .out = c1);
-  ActSink<4, EXP>   snk (.in = c1, .pass = pass);
+  ActSrc<4, {-1.0, 0.0, 0.5, 2.0}>  src (.out = c0);
+  Activation<0, 0.0>                 dut (.in  = c0, .out = c1);
+  ActSink<4, {-1.0, 0.0, 0.5, 2.0}> snk (.in  = c1, .pass = pass);
 }
 
-/* --- 1b. Step (ACT_FN=1) ---
-   inputs : -1, 0, 0.5, 2
-   expected: 0, 1, 1, 1   (>= 0 → 1)
-*/
+/* 1b. Step (ACT_FN=1): >= 0 -> 1.0, else 0.0 */
 defproc TB_Act_Step (chan!(bool) pass)
 {
-  preal INP[4] = {-1.0, 0.0, 0.5, 2.0};
-  preal EXP[4] = { 0.0, 1.0, 1.0, 1.0};
-
   chan(math::fixpoint<8,8>) c0, c1;
-
-  ActSrc<4, INP>    src (.out = c0);
-  Activation<1, 0.0> dut (.in = c0, .out = c1);
-  ActSink<4, EXP>   snk (.in = c1, .pass = pass);
+  ActSrc<4, {-1.0, 0.0, 0.5, 2.0}>  src (.out = c0);
+  Activation<1, 0.0>                 dut (.in  = c0, .out = c1);
+  ActSink<4, { 0.0, 1.0, 1.0, 1.0}> snk (.in  = c1, .pass = pass);
 }
 
-/* --- 1c. ReLU (ACT_FN=2) ---
-   inputs : -2, -0.5, 0, 1.5
-   expected:  0,  0,  0, 1.5
-*/
+/* 1c. ReLU (ACT_FN=2): max(0, x) */
 defproc TB_Act_ReLU (chan!(bool) pass)
 {
-  preal INP[4] = {-2.0, -0.5, 0.0, 1.5};
-  preal EXP[4] = { 0.0,  0.0, 0.0, 1.5};
-
   chan(math::fixpoint<8,8>) c0, c1;
-
-  ActSrc<4, INP>    src (.out = c0);
-  Activation<2, 0.0> dut (.in = c0, .out = c1);
-  ActSink<4, EXP>   snk (.in = c1, .pass = pass);
+  ActSrc<4, {-2.0, -0.5, 0.0, 1.5}>  src (.out = c0);
+  Activation<2, 0.0>                  dut (.in  = c0, .out = c1);
+  ActSink<4, { 0.0,  0.0, 0.0, 1.5}> snk (.in  = c1, .pass = pass);
 }
 
-/* --- 1d. Leaky ReLU (ACT_FN=3, LEAK=0.1) ---
-   inputs : -2, -1, 0, 1
-   expected: -0.2, -0.1, 0, 1
-*/
+/* 1d. Leaky ReLU (ACT_FN=3, LEAK=0.1): x>=0 -> x, else 0.1*x */
 defproc TB_Act_LeakyReLU (chan!(bool) pass)
 {
-  preal INP[4] = {-2.0, -1.0, 0.0, 1.0};
-  preal EXP[4] = {-0.2, -0.1, 0.0, 1.0};
-
   chan(math::fixpoint<8,8>) c0, c1;
-
-  ActSrc<4, INP>       src (.out = c0);
-  Activation<3, 0.1>   dut (.in = c0, .out = c1);
-  ActSink<4, EXP>      snk (.in = c1, .pass = pass);
+  ActSrc<4, {-2.0,  -1.0, 0.0, 1.0}>  src (.out = c0);
+  Activation<3, 0.1>                   dut (.in  = c0, .out = c1);
+  ActSink<4, {-0.2, -0.1, 0.0, 1.0}>  snk (.in  = c1, .pass = pass);
 }
 
 
 /* ================================================================
-  2. FCLayer (compile-time weights, no activation)
+  2.  FCLayer – compile-time weights, no activation
 
-  Network: 2 inputs → 2 outputs
-    W = [[1, 0], [0, 1]]   (identity)
-    B = [0.5, -0.5]
-  Input: x = [1, 2]
-  Expected output: [1*1 + 0*2 + 0.5, 0*1 + 1*2 - 0.5] = [1.5, 1.5]
+  W = [[1,0],[0,1]]  B = [0.5, -0.5]
+  Input x = [1, 2]
+  Expected: [1*1+0*2+0.5, 0*1+1*2-0.5] = [1.5, 1.5]
   ================================================================ */
 
 template<pint DUMMY>
 defproc FCLayerSrc2 (chan!(math::fixpoint<8,8>) x[2])
 {
   math::fixpoint<8,8> v0, v1;
-
   chp {
-    v0.set(v0.const(1.0));
-    v1.set(v1.const(2.0));
+    v0.set(v0.const(1.0)); v1.set(v1.const(2.0));
     x[0]!v0; x[1]!v1
   }
 }
@@ -181,24 +109,22 @@ defproc FCLayerSrc2 (chan!(math::fixpoint<8,8>) x[2])
 template<pint DUMMY>
 defproc FCLayerSink2 (chan?(math::fixpoint<8,8>) out[2]; chan!(bool) pass)
 {
-  math::fixpoint<8,8> v0, v1, eps, diff, adiff;
+  math::fixpoint<8,8> v0, v1, ref, eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    ref.set(ref.const(1.5));
     ok := true;
-
     out[0]?v0; out[1]?v1;
 
-    /* check v0 ≈ 1.5 */
-    diff := v0 - diff.const(1.5);
-    [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+    diff := v0 - ref;
+    [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
     diff := eps - adiff;
     [ diff.negative() -> ok := false [] else -> skip ];
 
-    /* check v1 ≈ 1.5 */
-    diff := v1 - diff.const(1.5);
-    [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+    diff := v1 - ref;
+    [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
     diff := eps - adiff;
     [ diff.negative() -> ok := false [] else -> skip ];
 
@@ -208,31 +134,26 @@ defproc FCLayerSink2 (chan?(math::fixpoint<8,8>) out[2]; chan!(bool) pass)
 
 defproc TB_FCLayer (chan!(bool) pass)
 {
-  preal W[4] = {1.0, 0.0,
-                0.0, 1.0};
-  preal B[2] = {0.5, -0.5};
-
   chan(math::fixpoint<8,8>) x[2], y[2];
-
-  FCLayerSrc2<0>          src (.x = x);
-  FCLayer<2, 2, W, B>     dut (.x_in = x, .out = y);
-  FCLayerSink2<0>         snk (.out = y, .pass = pass);
+  FCLayerSrc2<0>                          src (.x    = x);
+  FCLayer<2, 2,
+          {1.0, 0.0, 0.0, 1.0},
+          {0.5, -0.5}>                    dut (.x_in = x, .out = y);
+  FCLayerSink2<0>                         snk (.out  = y, .pass = pass);
 }
 
 
 /* ================================================================
-  3. FCLayerAct – ReLU, same weights, checks negative output clamped
+  3.  FCLayerAct – ReLU clamps negative sum to 0
 
-  W = [[-1, -1]], B = [0.0]
-  Input: x = [1, 1]
-  raw acc = -2; after ReLU → 0
+  W = [[-1,-1]]  B = [0.0]
+  Input x = [1,1]  raw acc = -2  ->  ReLU  ->  0
   ================================================================ */
 
 template<pint DUMMY>
 defproc FCActSrc (chan!(math::fixpoint<8,8>) x[2])
 {
   math::fixpoint<8,8> v;
-
   chp {
     v.set(v.const(1.0));
     x[0]!v; x[1]!v
@@ -242,14 +163,15 @@ defproc FCActSrc (chan!(math::fixpoint<8,8>) x[2])
 template<pint DUMMY>
 defproc FCActSink (chan?(math::fixpoint<8,8>) out[1]; chan!(bool) pass)
 {
-  math::fixpoint<8,8> v, eps, diff, adiff;
+  math::fixpoint<8,8> v, zero, eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    zero.set(zero.const(0.0));
     out[0]?v;
-    diff := v - diff.const(0.0);
-    [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+    diff := v - zero;
+    [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
     diff := eps - adiff;
     ok := ~diff.negative();
     pass!ok
@@ -258,64 +180,69 @@ defproc FCActSink (chan?(math::fixpoint<8,8>) out[1]; chan!(bool) pass)
 
 defproc TB_FCLayerAct (chan!(bool) pass)
 {
-  preal W[2] = {-1.0, -1.0};
-  preal B[1] = {0.0};
-
   chan(math::fixpoint<8,8>) x[2], y[1];
-
-  FCActSrc<0>                    src (.x = x);
-  FCLayerAct<2, 1, 2, W, B, 0.0> dut (.x_in = x, .out = y);
-  FCActSink<0>                   snk (.out = y, .pass = pass);
+  FCActSrc<0>                             src (.x    = x);
+  FCLayerAct<2, 1, 2,
+             {-1.0, -1.0},
+             {0.0},
+             0.0>                         dut (.x_in = x, .out = y);
+  FCActSink<0>                            snk (.out  = y, .pass = pass);
 }
 
 
 /* ================================================================
-  4. WindowAssembler – 4×4 image, 3×3 kernel
-     Only (0,0) and (1,0) windows checked (first two valid windows).
+  4.  WindowAssembler – 4x4 image, 3x3 kernel
 
-  Pixels sent in row-major order: 0,1,2,...,15.
-  First valid window (row 2, col 2 of output) top-left pixel = (0,0):
-    buf rows 0-2, cols 0-2 → pixels 0,1,2,4,5,6,8,9,10
+  Pixels 0..15 sent in row-major order.
+  First valid window top-left at (0,0), assembled when circular buffer
+  holds rows 0-2 and col index reaches 2:
+    pixels (r,c) in a width-4 image: (0,0)..(2,2)
+    = 0,1,2, 4,5,6, 8,9,10
+  A 4x4 image with K=3 produces (4-3+1)^2 = 4 valid windows total.
+  We check the first and drain the rest.
   ================================================================ */
 
 template<pint DUMMY>
 defproc WinAsmSrc (chan!(math::fixpoint<8,8>) pix_in)
 {
   math::fixpoint<8,8> v[16];
-
   chp {
     (;i: 16: v[i].set(v[i].const(i * 1.0)));
     (;i: 16: pix_in!v[i])
   }
 }
 
-/* Checks the first K*K=9 tokens emitted from win[0..8] */
 template<pint DUMMY>
 defproc WinAsmSink (chan?(math::fixpoint<8,8>) win[9]; chan!(bool) pass)
 {
-  /* Expected first window: row-major pixels (0,0)..(2,2) of a 4-wide image
-     = 0,1,2,4,5,6,8,9,10 */
-  preal EXP[9] = {0.0, 1.0, 2.0, 4.0, 5.0, 6.0, 8.0, 9.0, 10.0};
-  math::fixpoint<8,8> v, exp[9], eps, diff, adiff;
+  math::fixpoint<8,8> v, exp[9], eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
-    (;i: 9: exp[i].set(exp[i].const(EXP[i])));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(0.0));
+    exp[1].set(exp[1].const(1.0));
+    exp[2].set(exp[2].const(2.0));
+    exp[3].set(exp[3].const(4.0));
+    exp[4].set(exp[4].const(5.0));
+    exp[5].set(exp[5].const(6.0));
+    exp[6].set(exp[6].const(8.0));
+    exp[7].set(exp[7].const(9.0));
+    exp[8].set(exp[8].const(10.0));
     ok := true;
 
     (;i: 9:
       win[i]?v;
       diff := v - exp[i];
-      [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ]
     );
 
-    /* Drain remaining windows silently to avoid deadlock */
-    (;_w: 9: win[_w]?v);   /* window (row2,col3): pixels 1,2,3,5,6,7,9,10,11 */
-    (;_w: 9: win[_w]?v);   /* window (row3,col2) */
-    (;_w: 9: win[_w]?v);   /* window (row3,col3) */
+    /* drain 3 remaining windows to avoid deadlock */
+    (;_w: 9: win[_w]?v);
+    (;_w: 9: win[_w]?v);
+    (;_w: 9: win[_w]?v);
 
     pass!ok
   }
@@ -325,25 +252,23 @@ defproc TB_WindowAssembler (chan!(bool) pass)
 {
   chan(math::fixpoint<8,8>) pix;
   chan(math::fixpoint<8,8>) win[9];
-
-  WinAsmSrc<0>              src (.pix_in = pix);
-  WindowAssembler<4, 4, 3>  dut (.pix_in = pix, .win = win);
-  WinAsmSink<0>             snk (.win = win, .pass = pass);
+  WinAsmSrc<0>             src (.pix_in = pix);
+  WindowAssembler<4, 4, 3> dut (.pix_in = pix, .win = win);
+  WinAsmSink<0>            snk (.win    = win,  .pass = pass);
 }
 
 
 /* ================================================================
-  5. WinFork – 1 input channel, fan-out to 3 filters, K=2
+  5.  WinFork – K=2, fan-out to 3 filters
 
-  Send one 2×2 window: [1, 2, 3, 4].
-  All three outputs must receive the same values.
+  Input window: [1, 2, 3, 4] (2x2).
+  All three filter outputs must receive the identical values.
   ================================================================ */
 
 template<pint DUMMY>
 defproc WinForkSrc (chan!(math::fixpoint<8,8>) win_in[4])
 {
   math::fixpoint<8,8> v[4];
-
   chp {
     (;k: 4: v[k].set(v[k].const((k+1)*1.0)));
     (;k: 4: win_in[k]!v[k])
@@ -353,25 +278,25 @@ defproc WinForkSrc (chan!(math::fixpoint<8,8>) win_in[4])
 template<pint DUMMY>
 defproc WinForkSink (chan?(math::fixpoint<8,8>) win_out[3][4]; chan!(bool) pass)
 {
-  preal EXP[4] = {1.0, 2.0, 3.0, 4.0};
-  math::fixpoint<8,8> v, exp[4], eps, diff, adiff;
+  math::fixpoint<8,8> v, exp[4], eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
-    (;k: 4: exp[k].set(exp[k].const(EXP[k])));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(1.0));
+    exp[1].set(exp[1].const(2.0));
+    exp[2].set(exp[2].const(3.0));
+    exp[3].set(exp[3].const(4.0));
     ok := true;
-
     (;f: 3:
       (;k: 4:
         win_out[f][k]?v;
         diff := v - exp[k];
-        [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+        [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
         diff := eps - adiff;
         [ diff.negative() -> ok := false [] else -> skip ]
       )
     );
-
     pass!ok
   }
 }
@@ -380,128 +305,113 @@ defproc TB_WinFork (chan!(bool) pass)
 {
   chan(math::fixpoint<8,8>) win_in[4];
   chan(math::fixpoint<8,8>) win_out[3][4];
-
-  WinForkSrc<0>       src (.win_in = win_in);
-  WinFork<3, 2>       dut (.win_in = win_in, .win_out = win_out);
-  WinForkSink<0>      snk (.win_out = win_out, .pass = pass);
+  WinForkSrc<0>  src (.win_in  = win_in);
+  WinFork<3, 2>  dut (.win_in  = win_in, .win_out = win_out);
+  WinForkSink<0> snk (.win_out = win_out, .pass = pass);
 }
 
 
 /* ================================================================
-  6. ConvBank – 1×1 kernel, 1 channel, 2 filters (simplest possible)
+  6.  ConvBank – K=1, N_IN_CH=1, N_OUT=2
 
-  K=1, N_IN_CH=1, N_OUT=2
-  W[f*1*1 + 0*1 + 0]: W[0]=2.0 (filter 0), W[1]=-1.0 (filter 1)
-  B: B[0]=0.0, B[1]=1.0
-  Input window: [3.0]
-  Expected: out[0] = 2*3+0 = 6, out[1] = -1*3+1 = -2
+  W = [2.0, -1.0]  B = [0.0, 1.0]  input window = [3.0]
+  Expected: out[0] = 2*3+0 = 6,  out[1] = -1*3+1 = -2
   ================================================================ */
 
 template<pint DUMMY>
 defproc ConvBankSrc (chan!(math::fixpoint<8,8>) win[2][1][1])
 {
   math::fixpoint<8,8> v;
-
   chp {
     v.set(v.const(3.0));
-    win[0][0][0]!v;
-    win[1][0][0]!v
+    win[0][0][0]!v; win[1][0][0]!v
   }
 }
 
 template<pint DUMMY>
 defproc ConvBankSink (chan?(math::fixpoint<8,8>) out[2]; chan!(bool) pass)
 {
-  preal EXP[2] = {6.0, -2.0};
-  math::fixpoint<8,8> v, exp[2], eps, diff, adiff;
+  math::fixpoint<8,8> v, exp[2], eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
-    (;f: 2: exp[f].set(exp[f].const(EXP[f])));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(6.0));
+    exp[1].set(exp[1].const(-2.0));
     ok := true;
-
     (;f: 2:
       out[f]?v;
       diff := v - exp[f];
-      [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ]
     );
-
     pass!ok
   }
 }
 
 defproc TB_ConvBank (chan!(bool) pass)
 {
-  preal W[2] = {2.0, -1.0};
-  preal B[2] = {0.0, 1.0};
-
   chan(math::fixpoint<8,8>) win[2][1][1];
   chan(math::fixpoint<8,8>) out[2];
-
-  ConvBankSrc<0>             src (.win = win);
-  ConvBank<1, 1, 2, W, B>    dut (.win = win, .out = out);
-  ConvBankSink<0>            snk (.out = out, .pass = pass);
+  ConvBankSrc<0>                src (.win = win);
+  ConvBank<1, 1, 2,
+           {2.0, -1.0},
+           {0.0,  1.0}>         dut (.win = win, .out = out);
+  ConvBankSink<0>               snk (.out = out, .pass = pass);
 }
 
 
 /* ================================================================
-  7. ConvBankAct – same as above but with ReLU (filter 1 output -2 → 0)
+  7.  ConvBankAct – same as ConvBank but ReLU clamps -2 -> 0
   ================================================================ */
 
 template<pint DUMMY>
 defproc ConvBankActSink (chan?(math::fixpoint<8,8>) out[2]; chan!(bool) pass)
 {
-  preal EXP[2] = {6.0, 0.0};   /* ReLU clamps -2 to 0 */
-  math::fixpoint<8,8> v, exp[2], eps, diff, adiff;
+  math::fixpoint<8,8> v, exp[2], eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
-    (;f: 2: exp[f].set(exp[f].const(EXP[f])));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(6.0));
+    exp[1].set(exp[1].const(0.0));   /* ReLU clamps -2 to 0 */
     ok := true;
-
     (;f: 2:
       out[f]?v;
       diff := v - exp[f];
-      [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ]
     );
-
     pass!ok
   }
 }
 
 defproc TB_ConvBankAct (chan!(bool) pass)
 {
-  preal W[2] = {2.0, -1.0};
-  preal B[2] = {0.0, 1.0};
-
   chan(math::fixpoint<8,8>) win[2][1][1];
   chan(math::fixpoint<8,8>) out[2];
-
-  ConvBankSrc<0>                      src (.win = win);
-  ConvBankAct<1, 1, 2, 2, W, B, 0.0>  dut (.win = win, .out = out);
-  ConvBankActSink<0>                  snk (.out = out, .pass = pass);
+  ConvBankSrc<0>                    src (.win = win);
+  ConvBankAct<1, 1, 2, 2,
+              {2.0, -1.0},
+              {0.0,  1.0},
+              0.0>                   dut (.win = win, .out = out);
+  ConvBankActSink<0>                snk (.out = out, .pass = pass);
 }
 
 
 /* ================================================================
-  8. ConvLayer (compile-time) – 4×4 image, 1×1 kernel, 1 channel, 1 filter
+  8.  ConvLayer – compile-time, K=1 (identity conv)
 
-  K=1 means no windowing overhead; output is 4×4=16 values.
-  W=[1.0], B=[0.0] → output == input.
-  We only verify the first 4 pixels = 0,1,2,3.
+  4x4 image, 1 channel, 1 filter, W=[1], B=[0] -> output == input.
+  Check first 4 outputs; drain remaining 12.
   ================================================================ */
 
 template<pint DUMMY>
 defproc ConvLayerSrc (chan!(math::fixpoint<8,8>) pixel_in[1])
 {
   math::fixpoint<8,8> v[16];
-
   chp {
     (;i: 16: v[i].set(v[i].const(i * 1.0)));
     (;i: 16: pixel_in[0]!v[i])
@@ -511,105 +421,99 @@ defproc ConvLayerSrc (chan!(math::fixpoint<8,8>) pixel_in[1])
 template<pint DUMMY>
 defproc ConvLayerSink4 (chan?(math::fixpoint<8,8>) feat_out[1]; chan!(bool) pass)
 {
-  preal EXP[4] = {0.0, 1.0, 2.0, 3.0};
-  math::fixpoint<8,8> v, exp[4], eps, diff, adiff;
+  math::fixpoint<8,8> v, exp[4], eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
-    (;i: 4: exp[i].set(exp[i].const(EXP[i])));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(0.0));
+    exp[1].set(exp[1].const(1.0));
+    exp[2].set(exp[2].const(2.0));
+    exp[3].set(exp[3].const(3.0));
     ok := true;
-
     (;i: 4:
       feat_out[0]?v;
       diff := v - exp[i];
-      [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ]
     );
-
-    /* drain remaining 12 */
-    (;_i: 12: feat_out[0]?v);
-
+    (;_i: 12: feat_out[0]?v);    /* drain */
     pass!ok
   }
 }
 
 defproc TB_ConvLayer (chan!(bool) pass)
 {
-  preal W[1] = {1.0};
-  preal B[1] = {0.0};
-
-  chan(math::fixpoint<8,8>) pix[1];
-  chan(math::fixpoint<8,8>) feat[1];
-
-  ConvLayerSrc<0>                  src (.pixel_in = pix);
-  ConvLayer<4, 4, 1, 1, 1, W, B>   dut (.pixel_in = pix, .feat_out = feat);
-  ConvLayerSink4<0>                snk (.feat_out = feat, .pass = pass);
+  chan(math::fixpoint<8,8>) pix[1], feat[1];
+  ConvLayerSrc<0>                src (.pixel_in = pix);
+  ConvLayer<4, 4, 1, 1, 1,
+            {1.0},
+            {0.0}>               dut (.pixel_in = pix, .feat_out = feat);
+  ConvLayerSink4<0>              snk (.feat_out = feat, .pass = pass);
 }
 
 
 /* ================================================================
-  9. ConvLayerAct – same as ConvLayer but ReLU; negate bias so all
-     outputs become negative before ReLU → all zeros.
+  9.  ConvLayerAct – ReLU forces all outputs to zero
 
-  W=[1.0], B=[-100.0] → acc = pixel - 100; all negative → ReLU → 0
+  W=[1], B=[-100] -> acc = pixel-100 < 0 for all pixels 0..15
+  After ReLU every output must be 0.
   ================================================================ */
 
 template<pint DUMMY>
 defproc ConvLayerActSink (chan?(math::fixpoint<8,8>) feat_out[1]; chan!(bool) pass)
 {
-  math::fixpoint<8,8> v, eps, diff, adiff;
+  math::fixpoint<8,8> v, zero, eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    zero.set(zero.const(0.0));
     ok := true;
-
     (;_i: 16:
       feat_out[0]?v;
-      diff := v - diff.const(0.0);
-      [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+      diff := v - zero;
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ]
     );
-
     pass!ok
   }
 }
 
 defproc TB_ConvLayerAct (chan!(bool) pass)
 {
-  preal W[1] = {1.0};
-  preal B[1] = {-100.0};
-
-  chan(math::fixpoint<8,8>) pix[1];
-  chan(math::fixpoint<8,8>) feat[1];
-
-  ConvLayerSrc<0>                        src  (.pixel_in = pix);
-  ConvLayerAct<4, 4, 1, 1, 1, 2, W, B, 0.0>  dut (.pixel_in = pix, .feat_out = feat);
-  ConvLayerActSink<0>                    snk  (.feat_out = feat, .pass = pass);
+  chan(math::fixpoint<8,8>) pix[1], feat[1];
+  ConvLayerSrc<0>                    src (.pixel_in = pix);
+  ConvLayerAct<4, 4, 1, 1, 1, 2,
+               {1.0},
+               {-100.0},
+               0.0>                  dut (.pixel_in = pix, .feat_out = feat);
+  ConvLayerActSink<0>                snk (.feat_out = feat, .pass = pass);
 }
 
 
 /* ================================================================
-  10. MaxPool2x2 – 2 channels, 4×4 feature map
+  10. MaxPool2x2 – 2 channels, 4x4 feature map
 
-  Channel 0: row-major 0..15, stride 2 pools:
-    pool(0,1,4,5)=5, pool(2,3,6,7)=7, pool(8,9,12,13)=13, pool(10,11,14,15)=15
+  Channel 0: pixels 0..15 row-major.
+  2x2 stride-2 pooling windows:
+    window(0,1,4,5)    -> max = 5
+    window(2,3,6,7)    -> max = 7
+    window(8,9,12,13)  -> max = 13
+    window(10,11,14,15)-> max = 15
 
-  Channel 1: all pixels = 1.0 → all pool outputs = 1.0
+  Channel 1: all pixels = 1.0 -> all pool outputs = 1.0
   ================================================================ */
 
 template<pint DUMMY>
 defproc MaxPoolSrc (chan!(math::fixpoint<8,8>) feat_in[2])
 {
   math::fixpoint<8,8> v[16], one;
-
   chp {
     one.set(one.const(1.0));
     (;i: 16: v[i].set(v[i].const(i * 1.0)));
-    /* Both channels emit simultaneously; interleave by pixel */
     (;i: 16: feat_in[0]!v[i]; feat_in[1]!one)
   }
 }
@@ -617,250 +521,239 @@ defproc MaxPoolSrc (chan!(math::fixpoint<8,8>) feat_in[2])
 template<pint DUMMY>
 defproc MaxPoolSink (chan?(math::fixpoint<8,8>) pool_out[2]; chan!(bool) pass)
 {
-  preal EXP0[4] = {5.0, 7.0, 13.0, 15.0};
-  math::fixpoint<8,8> v, exp[4], eps, diff, adiff;
+  math::fixpoint<8,8> v, exp0[4], one, eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
-    (;i: 4: exp[i].set(exp[i].const(EXP0[i])));
+    negone.set(negone.const(-1.0));
+    one.set(one.const(1.0));
+    exp0[0].set(exp0[0].const(5.0));
+    exp0[1].set(exp0[1].const(7.0));
+    exp0[2].set(exp0[2].const(13.0));
+    exp0[3].set(exp0[3].const(15.0));
     ok := true;
-
     (;i: 4:
       pool_out[0]?v;
-      diff := v - exp[i];
-      [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+      diff := v - exp0[i];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ];
 
-      pool_out[1]?v;                   /* should be 1.0 */
-      diff := v - diff.const(1.0);
-      [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+      pool_out[1]?v;
+      diff := v - one;
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ]
     );
-
     pass!ok
   }
 }
 
 defproc TB_MaxPool2x2 (chan!(bool) pass)
 {
-  chan(math::fixpoint<8,8>) feat[2];
-  chan(math::fixpoint<8,8>) pool[2];
-
-  MaxPoolSrc<0>           src (.feat_in = feat);
-  MaxPool2x2<2, 4, 4>    dut (.feat_in = feat, .pool_out = pool);
-  MaxPoolSink<0>          snk (.pool_out = pool, .pass = pass);
+  chan(math::fixpoint<8,8>) feat[2], pool[2];
+  MaxPoolSrc<0>          src (.feat_in  = feat);
+  MaxPool2x2<2, 4, 4>   dut (.feat_in  = feat, .pool_out = pool);
+  MaxPoolSink<0>         snk (.pool_out = pool, .pass = pass);
 }
 
 
 /* ================================================================
   11. Flatten<N_CH=2, FEAT_H=1, FEAT_W=3>
 
-  Channel 0: [1, 2, 3]
-  Channel 1: [4, 5, 6]
-  Expected serial output (ch-major per pixel): 1,4,2,5,3,6
+  Channel 0: [1, 2, 3]   Channel 1: [4, 5, 6]
+  Flatten iterates (;ch: (;r: (;c:))) so order is ch-major:
+    1, 2, 3, 4, 5, 6
   ================================================================ */
 
 template<pint DUMMY>
 defproc FlattenSrc (chan!(math::fixpoint<8,8>) feat_in[2])
 {
-  math::fixpoint<8,8> v[3][2];
-
+  math::fixpoint<8,8> v0[3], v1[3];
   chp {
-    v[0][0].set(v[0][0].const(1.0)); v[0][1].set(v[0][1].const(4.0));
-    v[1][0].set(v[1][0].const(2.0)); v[1][1].set(v[1][1].const(5.0));
-    v[2][0].set(v[2][0].const(3.0)); v[2][1].set(v[2][1].const(6.0));
-
-    /* Flatten reads ch then r then c internally but in parallel —
-       drive channels independently so neither blocks. */
-    (;c: 3: feat_in[0]!v[c][0]; feat_in[1]!v[c][1])
+    v0[0].set(v0[0].const(1.0)); v0[1].set(v0[1].const(2.0)); v0[2].set(v0[2].const(3.0));
+    v1[0].set(v1[0].const(4.0)); v1[1].set(v1[1].const(5.0)); v1[2].set(v1[2].const(6.0));
+    /* Flatten reads ch=0 fully then ch=1 fully */
+    (;c: 3: feat_in[0]!v0[c]);
+    (;c: 3: feat_in[1]!v1[c])
   }
 }
 
 template<pint DUMMY>
 defproc FlattenSink (chan?(math::fixpoint<8,8>) flat_out; chan!(bool) pass)
 {
-  preal EXP[6] = {1.0, 4.0, 2.0, 5.0, 3.0, 6.0};
-  math::fixpoint<8,8> v, exp[6], eps, diff, adiff;
+  math::fixpoint<8,8> v, exp[6], eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
-    (;i: 6: exp[i].set(exp[i].const(EXP[i])));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(1.0)); exp[1].set(exp[1].const(2.0));
+    exp[2].set(exp[2].const(3.0)); exp[3].set(exp[3].const(4.0));
+    exp[4].set(exp[4].const(5.0)); exp[5].set(exp[5].const(6.0));
     ok := true;
-
     (;i: 6:
       flat_out?v;
       diff := v - exp[i];
-      [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ]
     );
-
     pass!ok
   }
 }
 
 defproc TB_Flatten (chan!(bool) pass)
 {
-  chan(math::fixpoint<8,8>) feat[2];
-  chan(math::fixpoint<8,8>) flat;
-
-  FlattenSrc<0>           src (.feat_in = feat);
-  Flatten<2, 1, 3>        dut (.feat_in = feat, .flat_out = flat);
-  FlattenSink<0>          snk (.flat_out = flat, .pass = pass);
+  chan(math::fixpoint<8,8>) feat[2], flat;
+  FlattenSrc<0>       src (.feat_in  = feat);
+  Flatten<2, 1, 3>    dut (.feat_in  = feat, .flat_out = flat);
+  FlattenSink<0>      snk (.flat_out = flat, .pass = pass);
 }
 
 
 /* ================================================================
   12. FlattenToParallel<N_CH=2, FEAT_H=1, FEAT_W=3>
 
-  Same source as Flatten.
+  Same data as Flatten.
   Output layout: flat_out[(r*FEAT_W + c)*N_CH + ch]
-    flat_out[0] = ch0,pixel0 = 1
-    flat_out[1] = ch1,pixel0 = 4
-    flat_out[2] = ch0,pixel1 = 2
-    flat_out[3] = ch1,pixel1 = 5
-    flat_out[4] = ch0,pixel2 = 3
-    flat_out[5] = ch1,pixel2 = 6
+    index 0: ch0,c0 = 1    index 1: ch1,c0 = 4
+    index 2: ch0,c1 = 2    index 3: ch1,c1 = 5
+    index 4: ch0,c2 = 3    index 5: ch1,c2 = 6
+
+  FlattenToParallel reads (;r:(;c:(;ch:...))) — consume both channels
+  per pixel — so drive both channels together per pixel.
   ================================================================ */
+
+template<pint DUMMY>
+defproc FlatParSrc (chan!(math::fixpoint<8,8>) feat_in[2])
+{
+  math::fixpoint<8,8> v0[3], v1[3];
+  chp {
+    v0[0].set(v0[0].const(1.0)); v0[1].set(v0[1].const(2.0)); v0[2].set(v0[2].const(3.0));
+    v1[0].set(v1[0].const(4.0)); v1[1].set(v1[1].const(5.0)); v1[2].set(v1[2].const(6.0));
+    (;c: 3: feat_in[0]!v0[c]; feat_in[1]!v1[c])
+  }
+}
 
 template<pint DUMMY>
 defproc FlatParSink (chan?(math::fixpoint<8,8>) flat_out[6]; chan!(bool) pass)
 {
-  preal EXP[6] = {1.0, 4.0, 2.0, 5.0, 3.0, 6.0};
-  math::fixpoint<8,8> v, exp[6], eps, diff, adiff;
+  math::fixpoint<8,8> v, exp[6], eps, negone, diff, adiff;
   bool ok;
-
   chp {
     eps.set(eps.const(0.02));
-    (;i: 6: exp[i].set(exp[i].const(EXP[i])));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(1.0)); exp[1].set(exp[1].const(4.0));
+    exp[2].set(exp[2].const(2.0)); exp[3].set(exp[3].const(5.0));
+    exp[4].set(exp[4].const(3.0)); exp[5].set(exp[5].const(6.0));
     ok := true;
-
     (;i: 6:
       flat_out[i]?v;
       diff := v - exp[i];
-      [ ~diff.negative() -> adiff := diff [] else -> adiff := diff * adiff.const(-1.0) ];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
       diff := eps - adiff;
       [ diff.negative() -> ok := false [] else -> skip ]
     );
-
     pass!ok
   }
 }
 
 defproc TB_FlattenToParallel (chan!(bool) pass)
 {
-  chan(math::fixpoint<8,8>) feat[2];
-  chan(math::fixpoint<8,8>) flat[6];
-
-  FlattenSrc<0>                   src (.feat_in = feat);
-  FlattenToParallel<2, 1, 3>      dut (.feat_in = feat, .flat_out = flat);
-  FlatParSink<0>                  snk (.flat_out = flat, .pass = pass);
+  chan(math::fixpoint<8,8>) feat[2], flat[6];
+  FlatParSrc<0>               src (.feat_in  = feat);
+  FlattenToParallel<2, 1, 3>  dut (.feat_in  = feat, .flat_out = flat);
+  FlatParSink<0>              snk (.flat_out = flat,  .pass = pass);
 }
 
 
 /* ================================================================
-  13. FCLayerParam / FCLayerActParam – runtime weight loading
-
-  Same identity network as TB_FCLayer but weights come through channels.
+  13. FCLayerParam – runtime weight loading, same identity test
   ================================================================ */
 
 defproc TB_FCLayerParam (chan!(bool) pass)
 {
-  preal W[4] = {1.0, 0.0, 0.0, 1.0};
-  preal B[2] = {0.5, -0.5};
-
-  chan(math::fixpoint<8,8>) x[2], y[2];
-  chan(math::fixpoint<8,8>) w_ch[4], b_ch[2];
-
-  FCLayerParamSource<2, 2, W, B> psrc (.w_out = w_ch, .b_out = b_ch);
-  FCLayerSrc2<0>                 xsrc (.x = x);
-  FCLayerParam<2, 2>             dut  (.x_in = x, .w_in = w_ch,
-                                        .b_in = b_ch, .out = y);
-  FCLayerSink2<0>                snk  (.out = y, .pass = pass);
-}
-
-defproc TB_FCLayerActParam (chan!(bool) pass)
-{
-  preal W[2] = {-1.0, -1.0};
-  preal B[1] = {0.0};
-
-  chan(math::fixpoint<8,8>) x[2], y[1];
-  chan(math::fixpoint<8,8>) w_ch[2], b_ch[1];
-
-  FCLayerParamSource<2, 1, W, B>          psrc (.w_out = w_ch, .b_out = b_ch);
-  FCActSrc<0>                             xsrc (.x = x);
-  FCLayerActParam<2, 1, 2, 0.0>           dut  (.x_in = x, .w_in = w_ch,
-                                                 .b_in = b_ch, .out = y);
-  FCActSink<0>                            snk  (.out = y, .pass = pass);
+  chan(math::fixpoint<8,8>) x[2], y[2], w_ch[4], b_ch[2];
+  FCLayerParamSource<2, 2,
+                     {1.0, 0.0, 0.0, 1.0},
+                     {0.5, -0.5}>        psrc (.w_out = w_ch, .b_out = b_ch);
+  FCLayerSrc2<0>                         xsrc (.x    = x);
+  FCLayerParam<2, 2>                     dut  (.x_in = x, .w_in = w_ch,
+                                               .b_in = b_ch, .out = y);
+  FCLayerSink2<0>                        snk  (.out  = y, .pass = pass);
 }
 
 
 /* ================================================================
-  14. ConvLayerParam / ConvLayerActParam – runtime conv weight loading
+  14. FCLayerActParam – runtime weights, ReLU clamps -2 -> 0
+  ================================================================ */
 
-  Same 4×4 identity conv as TB_ConvLayer; weights/biases via channels.
+defproc TB_FCLayerActParam (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) x[2], y[1], w_ch[2], b_ch[1];
+  FCLayerParamSource<2, 1,
+                     {-1.0, -1.0},
+                     {0.0}>              psrc (.w_out = w_ch, .b_out = b_ch);
+  FCActSrc<0>                            xsrc (.x    = x);
+  FCLayerActParam<2, 1, 2, 0.0>          dut  (.x_in = x, .w_in = w_ch,
+                                               .b_in = b_ch, .out = y);
+  FCActSink<0>                           snk  (.out  = y, .pass = pass);
+}
+
+
+/* ================================================================
+  15. ConvLayerParam – runtime conv weights, identity K=1
   ================================================================ */
 
 defproc TB_ConvLayerParam (chan!(bool) pass)
 {
-  preal W[1] = {1.0};
-  preal B[1] = {0.0};
-
-  chan(math::fixpoint<8,8>) pix[1], feat[1];
-  chan(math::fixpoint<8,8>) w_ch[1], b_ch[1];
-
-  ConvLayerParamSource<1, 1, 1, W, B>     psrc (.w_out = w_ch, .b_out = b_ch);
-  ConvLayerSrc<0>                         xsrc (.pixel_in = pix);
-  ConvLayerParam<4, 4, 1, 1, 1>           dut  (.pixel_in = pix,
-                                                 .w_in = w_ch, .b_in = b_ch,
-                                                 .feat_out = feat);
-  ConvLayerSink4<0>                       snk  (.feat_out = feat, .pass = pass);
-}
-
-defproc TB_ConvLayerActParam (chan!(bool) pass)
-{
-  preal W[1] = {1.0};
-  preal B[1] = {-100.0};
-
-  chan(math::fixpoint<8,8>) pix[1], feat[1];
-  chan(math::fixpoint<8,8>) w_ch[1], b_ch[1];
-
-  ConvLayerParamSource<1, 1, 1, W, B>         psrc (.w_out = w_ch, .b_out = b_ch);
-  ConvLayerSrc<0>                             xsrc (.pixel_in = pix);
-  ConvLayerActParam<4, 4, 1, 1, 1, 2, 0.0>   dut  (.pixel_in = pix,
-                                                     .w_in = w_ch, .b_in = b_ch,
-                                                     .feat_out = feat);
-  ConvLayerActSink<0>                         snk  (.feat_out = feat, .pass = pass);
+  chan(math::fixpoint<8,8>) pix[1], feat[1], w_ch[1], b_ch[1];
+  ConvLayerParamSource<1, 1, 1,
+                       {1.0},
+                       {0.0}>            psrc (.w_out = w_ch, .b_out = b_ch);
+  ConvLayerSrc<0>                        xsrc (.pixel_in = pix);
+  ConvLayerParam<4, 4, 1, 1, 1>          dut  (.pixel_in = pix,
+                                               .w_in = w_ch, .b_in = b_ch,
+                                               .feat_out = feat);
+  ConvLayerSink4<0>                      snk  (.feat_out = feat, .pass = pass);
 }
 
 
 /* ================================================================
-  15. End-to-end mini-CNN:
-      ConvLayerAct (1-ch, 4×4 → 4×4, 1 filter, identity+bias+ReLU)
-      → MaxPool2x2 (4×4 → 2×2)
-      → FlattenToParallel (4 parallel outputs)
-      → FCLayerAct (4→1, step fn, should fire if sum > 0)
+  16. ConvLayerActParam – runtime conv weights, ReLU zeros all
+  ================================================================ */
 
-  Pixel values: 0..15 (row-major)
-  Conv: W=1, B=-6 → acc = pixel-6; ReLU clamps negatives
-    outputs: 0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9  (pixels 0-6 clamped)
-  Pool (stride 2 over 4×4):
-    window(0,1,4,5): max(0,0,0,0)=0
-    window(2,3,6,7): max(0,0,1,2)=2   [after bias: pix7-6=1, pix6-6=0, etc.]
+defproc TB_ConvLayerActParam (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) pix[1], feat[1], w_ch[1], b_ch[1];
+  ConvLayerParamSource<1, 1, 1,
+                       {1.0},
+                       {-100.0}>         psrc (.w_out = w_ch, .b_out = b_ch);
+  ConvLayerSrc<0>                        xsrc (.pixel_in = pix);
+  ConvLayerActParam<4, 4, 1, 1, 1, 2, 0.0>
+                                         dut  (.pixel_in = pix,
+                                               .w_in = w_ch, .b_in = b_ch,
+                                               .feat_out = feat);
+  ConvLayerActSink<0>                    snk  (.feat_out = feat, .pass = pass);
+}
 
-  NOTE: exact pool values depend on conv bias; this test just checks
-  the pipeline assembles and produces exactly 1 output from the FC.
+
+/* ================================================================
+  17. End-to-end mini-CNN
+
+  ConvLayerAct (K=1, 1ch, 4x4, ReLU, B=-6)
+    -> MaxPool2x2 (4x4 -> 2x2, 1ch)
+    -> FlattenToParallel (1ch, 2x2 -> 4 parallel outputs)
+    -> FCLayerAct (4->1, step, W=0.25 each, B=-0.1)
+
+  Only checks that one token arrives (no deadlock); exact value
+  depends on floating-point rounding in the pool stage.
   ================================================================ */
 
 template<pint DUMMY>
 defproc E2ESrc (chan!(math::fixpoint<8,8>) pixel_in[1])
 {
   math::fixpoint<8,8> v[16];
-
   chp {
     (;i: 16: v[i].set(v[i].const(i * 1.0)));
     (;i: 16: pixel_in[0]!v[i])
@@ -871,121 +764,84 @@ template<pint DUMMY>
 defproc E2ESink (chan?(math::fixpoint<8,8>) out[1]; chan!(bool) pass)
 {
   math::fixpoint<8,8> v;
-
   chp {
     out[0]?v;
-    /* We only check that we got a value (not deadlocked).
-       The step function output is 0 or 1; both are valid
-       depending on the weighted sum sign. */
-    pass!true
+    pass!true    /* just verify no deadlock */
   }
 }
 
 defproc TB_E2E (chan!(bool) pass)
 {
-  preal CW[1] = {1.0};
-  preal CB[1] = {-6.0};
-  preal FW[4] = {0.25, 0.25, 0.25, 0.25};
-  preal FB[1] = {-0.1};
+  chan(math::fixpoint<8,8>) pix[1], conv_out[1], pool_out[1], flat[4], fc_out[1];
 
-  chan(math::fixpoint<8,8>) pix[1];
-  chan(math::fixpoint<8,8>) conv_out[1];
-  chan(math::fixpoint<8,8>) pool_out[1];
-  chan(math::fixpoint<8,8>) flat[4];
-  chan(math::fixpoint<8,8>) fc_out[1];
-
-  E2ESrc<0>                                       src   (.pixel_in = pix);
-  ConvLayerAct<4, 4, 1, 1, 1, 2, CW, CB, 0.0>    conv  (.pixel_in = pix,
-                                                          .feat_out = conv_out);
-  MaxPool2x2<1, 4, 4>                             pool  (.feat_in = conv_out,
-                                                          .pool_out = pool_out);
-  FlattenToParallel<1, 2, 2>                      flat_p(.feat_in = pool_out,
-                                                          .flat_out = flat);
-  FCLayerAct<4, 1, 1, FW, FB, 0.0>               fc    (.x_in = flat,
-                                                          .out = fc_out);
-  E2ESink<0>                                      snk   (.out = fc_out,
-                                                          .pass = pass);
+  E2ESrc<0>                                    src    (.pixel_in = pix);
+  ConvLayerAct<4, 4, 1, 1, 1, 2,
+               {1.0}, {-6.0}, 0.0>             conv   (.pixel_in = pix,
+                                                        .feat_out = conv_out);
+  MaxPool2x2<1, 4, 4>                          pool   (.feat_in  = conv_out,
+                                                        .pool_out = pool_out);
+  FlattenToParallel<1, 2, 2>                   flat_p (.feat_in  = pool_out,
+                                                        .flat_out = flat);
+  FCLayerAct<4, 1, 1,
+             {0.25, 0.25, 0.25, 0.25},
+             {-0.1},
+             0.0>                              fc     (.x_in = flat, .out = fc_out);
+  E2ESink<0>                                   snk    (.out  = fc_out, .pass = pass);
 }
 
 
 /* ================================================================
-  Main – compose all testbenches and print results
+  Main – instantiate all testbenches and log results
   ================================================================ */
 
 defproc Main ()
 {
-  chan(bool) p_act_lin, p_act_step, p_act_relu, p_act_lrelu;
-  chan(bool) p_fc, p_fc_act;
-  chan(bool) p_win, p_winfork;
-  chan(bool) p_cb, p_cb_act;
-  chan(bool) p_cl, p_cl_act;
-  chan(bool) p_pool;
-  chan(bool) p_flat, p_flatpar;
-  chan(bool) p_fcp, p_fcap;
-  chan(bool) p_clp, p_clap;
-  chan(bool) p_e2e;
+  chan(bool) p[17];
+  chan(bool) q[3];
 
-  TB_Act_Linear       t01 (.pass = p_act_lin);
-  TB_Act_Step         t02 (.pass = p_act_step);
-  TB_Act_ReLU         t03 (.pass = p_act_relu);
-  TB_Act_LeakyReLU    t04 (.pass = p_act_lrelu);
+  TB_Act_Linear        t00 (.pass = p[0]);
+  TB_Act_Step          t01 (.pass = p[1]);
+  TB_Act_ReLU          t02 (.pass = p[2]);
+  TB_Act_LeakyReLU     t03 (.pass = p[3]);
+  TB_FCLayer           t04 (.pass = p[4]);
+  TB_FCLayerAct        t05 (.pass = p[5]);
+  TB_WindowAssembler   t06 (.pass = p[6]);
+  TB_WinFork           t07 (.pass = p[7]);
+  TB_ConvBank          t08 (.pass = p[8]);
+  TB_ConvBankAct       t09 (.pass = p[9]);
+  TB_ConvLayer         t10 (.pass = p[10]);
+  TB_ConvLayerAct      t11 (.pass = p[11]);
+  TB_MaxPool2x2        t12 (.pass = p[12]);
+  TB_Flatten           t13 (.pass = p[13]);
+  TB_FlattenToParallel t14 (.pass = p[14]);
+  TB_FCLayerParam      t15 (.pass = p[15]);
+  TB_FCLayerActParam   t16 (.pass = p[16]);
+  TB_ConvLayerParam    u00 (.pass = q[0]);
+  TB_ConvLayerActParam u01 (.pass = q[1]);
+  TB_E2E               u02 (.pass = q[2]);
 
-  TB_FCLayer          t05 (.pass = p_fc);
-  TB_FCLayerAct       t06 (.pass = p_fc_act);
-
-  TB_WindowAssembler  t07 (.pass = p_win);
-  TB_WinFork          t08 (.pass = p_winfork);
-
-  TB_ConvBank         t09 (.pass = p_cb);
-  TB_ConvBankAct      t10 (.pass = p_cb_act);
-
-  TB_ConvLayer        t11 (.pass = p_cl);
-  TB_ConvLayerAct     t12 (.pass = p_cl_act);
-
-  TB_MaxPool2x2       t13 (.pass = p_pool);
-
-  TB_Flatten          t14 (.pass = p_flat);
-  TB_FlattenToParallel t15 (.pass = p_flatpar);
-
-  TB_FCLayerParam     t16 (.pass = p_fcp);
-  TB_FCLayerActParam  t17 (.pass = p_fcap);
-
-  TB_ConvLayerParam   t18 (.pass = p_clp);
-  TB_ConvLayerActParam t19 (.pass = p_clap);
-
-  TB_E2E              t20 (.pass = p_e2e);
-
-  bool results[20];
+  bool r[17], s[3];
 
   chp {
-    p_act_lin?results[0];   log("Activation/Linear      : ", results[0]);
-    p_act_step?results[1];  log("Activation/Step        : ", results[1]);
-    p_act_relu?results[2];  log("Activation/ReLU        : ", results[2]);
-    p_act_lrelu?results[3]; log("Activation/LeakyReLU   : ", results[3]);
-
-    p_fc?results[4];        log("FCLayer                : ", results[4]);
-    p_fc_act?results[5];    log("FCLayerAct             : ", results[5]);
-
-    p_win?results[6];       log("WindowAssembler        : ", results[6]);
-    p_winfork?results[7];   log("WinFork                : ", results[7]);
-
-    p_cb?results[8];        log("ConvBank               : ", results[8]);
-    p_cb_act?results[9];    log("ConvBankAct            : ", results[9]);
-
-    p_cl?results[10];       log("ConvLayer              : ", results[10]);
-    p_cl_act?results[11];   log("ConvLayerAct           : ", results[11]);
-
-    p_pool?results[12];     log("MaxPool2x2             : ", results[12]);
-
-    p_flat?results[13];     log("Flatten                : ", results[13]);
-    p_flatpar?results[14];  log("FlattenToParallel      : ", results[14]);
-
-    p_fcp?results[15];      log("FCLayerParam           : ", results[15]);
-    p_fcap?results[16];     log("FCLayerActParam        : ", results[16]);
-
-    p_clp?results[17];      log("ConvLayerParam         : ", results[17]);
-    p_clap?results[18];     log("ConvLayerActParam      : ", results[18]);
-
-    p_e2e?results[19];      log("E2E mini-CNN           : ", results[19])
+    p[0]?r[0];   log("Activation/Linear      : ", r[0]);
+    p[1]?r[1];   log("Activation/Step        : ", r[1]);
+    p[2]?r[2];   log("Activation/ReLU        : ", r[2]);
+    p[3]?r[3];   log("Activation/LeakyReLU   : ", r[3]);
+    p[4]?r[4];   log("FCLayer                : ", r[4]);
+    p[5]?r[5];   log("FCLayerAct             : ", r[5]);
+    p[6]?r[6];   log("WindowAssembler        : ", r[6]);
+    p[7]?r[7];   log("WinFork                : ", r[7]);
+    p[8]?r[8];   log("ConvBank               : ", r[8]);
+    p[9]?r[9];   log("ConvBankAct            : ", r[9]);
+    p[10]?r[10]; log("ConvLayer              : ", r[10]);
+    p[11]?r[11]; log("ConvLayerAct           : ", r[11]);
+    p[12]?r[12]; log("MaxPool2x2             : ", r[12]);
+    p[13]?r[13]; log("Flatten                : ", r[13]);
+    p[14]?r[14]; log("FlattenToParallel      : ", r[14]);
+    p[15]?r[15]; log("FCLayerParam           : ", r[15]);
+    p[16]?r[16]; log("FCLayerActParam        : ", r[16]);
+    q[0]?s[0];   log("ConvLayerParam         : ", s[0]);
+    q[1]?s[1];   log("ConvLayerActParam      : ", s[1]);
+    q[2]?s[2];   log("E2E mini-CNN           : ", s[2])
   }
 }
