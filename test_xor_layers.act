@@ -1,0 +1,104 @@
+/* ================================================================
+  test_xor_layers.act
+
+  Simple XOR test for nn_layers_runtime_params.act.
+ ================================================================ */
+
+import "nn_layers_runtime_params.act";
+
+
+defproc XORNet (chan?(math::fixpoint<8,8>) x0_in, x1_in;
+                chan!(math::fixpoint<8,8>) xor_out, xnor_out)
+{
+  chan(math::fixpoint<8,8>) input_vec[2];
+  chan(math::fixpoint<8,8>) hidden_out[2];
+  chan(math::fixpoint<8,8>) class_out[2];
+
+  chan(math::fixpoint<8,8>) hidden_w[4];
+  chan(math::fixpoint<8,8>) hidden_b[2];
+  chan(math::fixpoint<8,8>) output_w[4];
+  chan(math::fixpoint<8,8>) output_b[2];
+
+  input_vec[0] = x0_in;
+  input_vec[1] = x1_in;
+  class_out[0] = xor_out;
+  class_out[1] = xnor_out;
+
+  FCLayerSource<2, 2,
+                { 5.0, 5.0,
+                  5.0, 5.0 },
+                { -3.0, -8.0 }> hidden_params (hidden_w, hidden_b);
+
+  FCLayer<2, 2, 1, 0.0> hidden_layer (
+    input_vec, hidden_w, hidden_b, hidden_out
+  );
+
+  FCLayerSource<2, 2,
+                {  5.0, -5.0,
+                  -5.0,  5.0 },
+                { -2.0, 2.0 }> output_params (output_w, output_b);
+
+  FCLayer<2, 2, 1, 0.0> output_layer (
+    hidden_out, output_w, output_b, class_out
+  );
+}
+
+
+defproc XORTestbench (chan!(math::fixpoint<8,8>) x0, x1;
+                      chan?(math::fixpoint<8,8>) xor_out, xnor_out)
+{
+  math::fixpoint<8,8> zero, one, half, xv, nv, diff;
+  bool xb, nb;
+
+  chp {
+    zero.set(zero.const(0.0));
+    one.set(one.const(1.0));
+    half.set(half.const(0.5));
+
+    x0!zero; x1!zero;
+    xor_out?xv; xnor_out?nv;
+    diff := xv - half;
+    [ ~diff.negative() -> xb := true [] else -> xb := false ];
+    diff := nv - half;
+    [ ~diff.negative() -> nb := true [] else -> nb := false ];
+    log("xor(0,0) = ", xb);
+    log("xnor(0,0) = ", nb);
+
+    x0!zero; x1!one;
+    xor_out?xv; xnor_out?nv;
+    diff := xv - half;
+    [ ~diff.negative() -> xb := true [] else -> xb := false ];
+    diff := nv - half;
+    [ ~diff.negative() -> nb := true [] else -> nb := false ];
+    log("xor(0,1) = ", xb);
+    log("xnor(0,1) = ", nb);
+
+    x0!one; x1!zero;
+    xor_out?xv; xnor_out?nv;
+    diff := xv - half;
+    [ ~diff.negative() -> xb := true [] else -> xb := false ];
+    diff := nv - half;
+    [ ~diff.negative() -> nb := true [] else -> nb := false ];
+    log("xor(1,0) = ", xb);
+    log("xnor(1,0) = ", nb);
+
+    x0!one; x1!one;
+    xor_out?xv; xnor_out?nv;
+    diff := xv - half;
+    [ ~diff.negative() -> xb := true [] else -> xb := false ];
+    diff := nv - half;
+    [ ~diff.negative() -> nb := true [] else -> nb := false ];
+    log("xor(1,1) = ", xb);
+    log("xnor(1,1) = ", nb)
+  }
+}
+
+
+defproc test ()
+{
+  chan(math::fixpoint<8,8>) x0, x1;
+  chan(math::fixpoint<8,8>) xor_out, xnor_out;
+
+  XORNet dut (x0, x1, xor_out, xnor_out);
+  XORTestbench tb (x0, x1, xor_out, xnor_out);
+}

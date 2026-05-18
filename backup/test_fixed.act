@@ -1,0 +1,47 @@
+import "math/fxp.act";
+
+defproc source (chan!(math::fixpoint<8,8>) X)
+{
+  math::fixpoint<8,8> v;
+  chp {
+    v.set(v.const(1.5));
+    *[X!v]
+  }
+}
+
+defproc sink (chan?(math::fixpoint<8,8>) X)
+{
+  math::fixpoint<8,8> v;
+  chp {
+    *[ X?v; v.log() ]
+  }
+}
+
+template<preal A>
+defproc fx(chan?(math::fixpoint<8,8>) in; chan!(math::fixpoint<8,8>) out) {
+  math::fixpoint<8,8> a, b, c;
+
+  chp {
+    a.set(a.const(A));
+    // b.set(b.const(B));
+    in?b;
+    a.log();
+    b.log();
+
+    c := a * b;
+    out!c
+    //[
+      //  ~c.negative() -> out!c
+      //  [] else -> out!a
+    // ] 
+   // c := a - b; c.log();
+   // c := a * b; c.log();
+   // c := a / b; c.log()
+  }
+}
+
+defproc test(){
+  source src;
+  sink snk;
+  fx<(-10.0)> dut(src.X, snk.X);
+}

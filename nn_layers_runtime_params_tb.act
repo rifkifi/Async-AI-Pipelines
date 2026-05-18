@@ -1,0 +1,642 @@
+/* ================================================================
+  nn_layers_runtime_params_tb.act
+
+  Functional testbench for nn_layers_runtime_params.act.
+ ================================================================ */
+
+import "nn_layers_runtime_params.act";
+
+
+template<pint N; preal V[N]>
+defproc FxpSrc (chan!(math::fixpoint<8,8>) out)
+{
+  math::fixpoint<8,8> v[N];
+  chp {
+    (;i: N: v[i].set(v[i].const(V[i])));
+    (;i: N: out!v[i])
+  }
+}
+
+
+template<pint N; preal EXP[N]>
+defproc FxpSink (chan?(math::fixpoint<8,8>) in; chan!(bool) pass)
+{
+  math::fixpoint<8,8> v, exp[N], eps, negone, diff, adiff;
+  bool ok;
+
+  chp {
+    eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    (;i: N: exp[i].set(exp[i].const(EXP[i])));
+    ok := true;
+
+    (;i: N:
+      in?v;
+      diff := v - exp[i];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+      diff := eps - adiff;
+      [ diff.negative() -> ok := false [] else -> skip ]
+    );
+
+    pass!ok
+  }
+}
+
+
+/* ================================================================
+  1. Activation, ReLU
+  ================================================================ */
+
+defproc TB_Activation (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) c0, c1;
+
+  FxpSrc<4, {-2.0, -0.5, 0.0, 1.5}> src (.out = c0);
+  Activation<2, 0.0>                 dut (.in = c0, .out = c1);
+  FxpSink<4, { 0.0,  0.0, 0.0, 1.5}> snk (.in = c1, .pass = pass);
+}
+
+
+/* ================================================================
+  2. WindowAssembler, 4x4 image with 3x3 kernel
+  ================================================================ */
+
+template<pint DUMMY>
+defproc WinAsmSrc (chan!(math::fixpoint<8,8>) pix_in)
+{
+  math::fixpoint<8,8> v[16];
+  chp {
+    (;i: 16: v[i].set(v[i].const(i * 1.0)));
+    (;i: 16: pix_in!v[i])
+  }
+}
+
+
+template<pint DUMMY>
+defproc WinAsmSink (chan?(math::fixpoint<8,8>) win[9]; chan!(bool) pass)
+{
+  math::fixpoint<8,8> v, exp[9], eps, negone, diff, adiff;
+  bool ok;
+
+  chp {
+    eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(0.0));
+    exp[1].set(exp[1].const(1.0));
+    exp[2].set(exp[2].const(2.0));
+    exp[3].set(exp[3].const(4.0));
+    exp[4].set(exp[4].const(5.0));
+    exp[5].set(exp[5].const(6.0));
+    exp[6].set(exp[6].const(8.0));
+    exp[7].set(exp[7].const(9.0));
+    exp[8].set(exp[8].const(10.0));
+    ok := true;
+
+    (;i: 9:
+      win[i]?v;
+      diff := v - exp[i];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+      diff := eps - adiff;
+      [ diff.negative() -> ok := false [] else -> skip ]
+    );
+
+    (;_w: 9: win[_w]?v);
+    (;_w: 9: win[_w]?v);
+    (;_w: 9: win[_w]?v);
+
+    pass!ok
+  }
+}
+
+
+defproc TB_WindowAssembler (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) pix;
+  chan(math::fixpoint<8,8>) win[9];
+
+  WinAsmSrc<0>              src (.pix_in = pix);
+  WindowAssembler<4, 4, 3>  dut (.pix_in = pix, .win = win);
+  WinAsmSink<0>             snk (.win = win, .pass = pass);
+}
+
+
+/* ================================================================
+  3. WinFork, K=2 to 3 outputs
+  ================================================================ */
+
+template<pint DUMMY>
+defproc WinForkSrc (chan!(math::fixpoint<8,8>) win_in[4])
+{
+  math::fixpoint<8,8> v[4];
+  chp {
+    (;k: 4: v[k].set(v[k].const((k+1)*1.0)));
+    (;k: 4: win_in[k]!v[k])
+  }
+}
+
+
+template<pint DUMMY>
+defproc WinForkSink (chan?(math::fixpoint<8,8>) win_out[3][4]; chan!(bool) pass)
+{
+  math::fixpoint<8,8> v, exp[4], eps, negone, diff, adiff;
+  bool ok;
+
+  chp {
+    eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(1.0));
+    exp[1].set(exp[1].const(2.0));
+    exp[2].set(exp[2].const(3.0));
+    exp[3].set(exp[3].const(4.0));
+    ok := true;
+
+    (;f: 3:
+      (;k: 4:
+        win_out[f][k]?v;
+        diff := v - exp[k];
+        [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+        diff := eps - adiff;
+        [ diff.negative() -> ok := false [] else -> skip ]
+      )
+    );
+
+    pass!ok
+  }
+}
+
+
+defproc TB_WinFork (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) win_in[4];
+  chan(math::fixpoint<8,8>) win_out[3][4];
+
+  WinForkSrc<0>  src (.win_in = win_in);
+  WinFork<3, 2>  dut (.win_in = win_in, .win_out = win_out);
+  WinForkSink<0> snk (.win_out = win_out, .pass = pass);
+}
+
+
+/* ================================================================
+  4. MaxPool, two 4x4 channels with P=2
+  ================================================================ */
+
+template<pint DUMMY>
+defproc MaxPoolSrc (chan!(math::fixpoint<8,8>) feat_in[2])
+{
+  math::fixpoint<8,8> v[16], one;
+  chp {
+    one.set(one.const(1.0));
+    (;i: 16: v[i].set(v[i].const(i * 1.0)));
+    ( (;i: 16: feat_in[0]!v[i]) , (;i: 16: feat_in[1]!one) )
+  }
+}
+
+
+template<pint DUMMY>
+defproc MaxPoolSink (chan?(math::fixpoint<8,8>) pool_out[2]; chan!(bool) pass)
+{
+  math::fixpoint<8,8> got0[4], got1[4];
+  math::fixpoint<8,8> exp0[4], one, eps, negone, diff, adiff;
+  bool ok;
+
+  chp {
+    eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    one.set(one.const(1.0));
+    exp0[0].set(exp0[0].const(5.0));
+    exp0[1].set(exp0[1].const(7.0));
+    exp0[2].set(exp0[2].const(13.0));
+    exp0[3].set(exp0[3].const(15.0));
+    ok := true;
+
+    ( (;i: 4: pool_out[0]?got0[i]) , (;i: 4: pool_out[1]?got1[i]) );
+
+    (;i: 4:
+      diff := got0[i] - exp0[i];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+      diff := eps - adiff;
+      [ diff.negative() -> ok := false [] else -> skip ];
+
+      diff := got1[i] - one;
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+      diff := eps - adiff;
+      [ diff.negative() -> ok := false [] else -> skip ]
+    );
+
+    pass!ok
+  }
+}
+
+
+defproc TB_MaxPool (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) feat[2], pool[2];
+
+  MaxPoolSrc<0>        src (.feat_in = feat);
+  MaxPool<2, 4, 4, 2> dut (.feat_in = feat, .pool_out = pool);
+  MaxPoolSink<0>       snk (.pool_out = pool, .pass = pass);
+}
+
+
+/* ================================================================
+  5. MaxPoolCh, one 6x6 channel with P=3
+ ================================================================ */
+
+template<pint DUMMY>
+defproc MaxPoolChSrc (chan!(math::fixpoint<8,8>) feat_in)
+{
+  math::fixpoint<8,8> v[36];
+  chp {
+    (;i: 36: v[i].set(v[i].const(i * 1.0)));
+    (;i: 36: feat_in!v[i])
+  }
+}
+
+
+template<pint DUMMY>
+defproc MaxPoolChSink (chan?(math::fixpoint<8,8>) pool_out; chan!(bool) pass)
+{
+  math::fixpoint<8,8> v, exp[4], eps, negone, diff, adiff;
+  bool ok;
+
+  chp {
+    eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(14.0));
+    exp[1].set(exp[1].const(17.0));
+    exp[2].set(exp[2].const(32.0));
+    exp[3].set(exp[3].const(35.0));
+    ok := true;
+
+    (;i: 4:
+      pool_out?v;
+      diff := v - exp[i];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+      diff := eps - adiff;
+      [ diff.negative() -> ok := false [] else -> skip ]
+    );
+
+    pass!ok
+  }
+}
+
+
+defproc TB_MaxPoolCh (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) feat, pool;
+
+  MaxPoolChSrc<0>      src (.feat_in = feat);
+  MaxPoolCh<3, 6, 6>  dut (.in = feat, .out = pool);
+  MaxPoolChSink<0>     snk (.pool_out = pool, .pass = pass);
+}
+
+
+/* ================================================================
+  6. Flatten, parallel output layout
+ ================================================================ */
+
+template<pint DUMMY>
+defproc FlattenSrc (chan!(math::fixpoint<8,8>) feat_in[2])
+{
+  math::fixpoint<8,8> v0[3], v1[3];
+  chp {
+    v0[0].set(v0[0].const(1.0)); v0[1].set(v0[1].const(2.0)); v0[2].set(v0[2].const(3.0));
+    v1[0].set(v1[0].const(4.0)); v1[1].set(v1[1].const(5.0)); v1[2].set(v1[2].const(6.0));
+    (;c: 3: feat_in[0]!v0[c]; feat_in[1]!v1[c])
+  }
+}
+
+
+template<pint DUMMY>
+defproc FlattenSink (chan?(math::fixpoint<8,8>) flat_out[6]; chan!(bool) pass)
+{
+  math::fixpoint<8,8> v, exp[6], eps, negone, diff, adiff;
+  bool ok;
+
+  chp {
+    eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(1.0));
+    exp[1].set(exp[1].const(4.0));
+    exp[2].set(exp[2].const(2.0));
+    exp[3].set(exp[3].const(5.0));
+    exp[4].set(exp[4].const(3.0));
+    exp[5].set(exp[5].const(6.0));
+    ok := true;
+
+    (;i: 6:
+      flat_out[i]?v;
+      diff := v - exp[i];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+      diff := eps - adiff;
+      [ diff.negative() -> ok := false [] else -> skip ]
+    );
+
+    pass!ok
+  }
+}
+
+
+defproc TB_Flatten (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) feat[2], flat[6];
+
+  FlattenSrc<0>     src (.feat_in = feat);
+  Flatten<2, 1, 3>  dut (.feat_in = feat, .flat_out = flat);
+  FlattenSink<0>    snk (.flat_out = flat, .pass = pass);
+}
+
+
+/* ================================================================
+  7. FCLayerSource + FCLayer, linear identity+bias test
+  ================================================================ */
+
+template<pint DUMMY>
+defproc FCLayerSrc2 (chan!(math::fixpoint<8,8>) x[2])
+{
+  math::fixpoint<8,8> v0, v1;
+  chp {
+    v0.set(v0.const(1.0));
+    v1.set(v1.const(2.0));
+    x[0]!v0; x[1]!v1
+  }
+}
+
+
+template<pint DUMMY>
+defproc FCLayerSink2 (chan?(math::fixpoint<8,8>) out[2]; chan!(bool) pass)
+{
+  math::fixpoint<8,8> v0, v1, ref, eps, negone, diff, adiff;
+  bool ok;
+
+  chp {
+    eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    ref.set(ref.const(1.5));
+    ok := true;
+
+    out[0]?v0; out[1]?v1;
+
+    diff := v0 - ref;
+    [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+    diff := eps - adiff;
+    [ diff.negative() -> ok := false [] else -> skip ];
+
+    diff := v1 - ref;
+    [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+    diff := eps - adiff;
+    [ diff.negative() -> ok := false [] else -> skip ];
+
+    pass!ok
+  }
+}
+
+
+defproc TB_FCLayer (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) x[2], y[2], w[4], b[2];
+
+  FCLayerSource<2, 2,
+                {1.0, 0.0,
+                 0.0, 1.0},
+                {0.5, -0.5}> params (.w_out = w, .b_out = b);
+  FCLayerSrc2<0>             src    (.x = x);
+  FCLayer<2, 2, 0, 0.0>      dut    (.x_in = x, .w_in = w, .b_in = b, .out = y);
+  FCLayerSink2<0>            snk    (.out = y, .pass = pass);
+}
+
+
+/* ================================================================
+  8. ConvBank, runtime weights, K=1
+  ================================================================ */
+
+template<pint DUMMY>
+defproc ConvBankSrc (chan!(math::fixpoint<8,8>) win[2][1][1])
+{
+  math::fixpoint<8,8> v;
+  chp {
+    v.set(v.const(3.0));
+    win[0][0][0]!v; win[1][0][0]!v
+  }
+}
+
+
+template<pint DUMMY>
+defproc ConvBankSink (chan?(math::fixpoint<8,8>) out[2]; chan!(bool) pass)
+{
+  math::fixpoint<8,8> v, exp[2], eps, negone, diff, adiff;
+  bool ok;
+
+  chp {
+    eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(6.0));
+    exp[1].set(exp[1].const(-2.0));
+    ok := true;
+
+    (;f: 2:
+      out[f]?v;
+      diff := v - exp[f];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+      diff := eps - adiff;
+      [ diff.negative() -> ok := false [] else -> skip ]
+    );
+
+    pass!ok
+  }
+}
+
+
+defproc TB_ConvBank (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) win[2][1][1], out[2], w[2], b[2];
+
+  ConvLayerSource<1, 1, 2,
+                  {2.0, -1.0},
+                  {0.0,  1.0}> params (.w_out = w, .b_out = b);
+  ConvBankSrc<0>              src    (.win = win);
+  ConvBank<1, 1, 2>           dut    (.win = win, .w_in = w, .b_in = b, .out = out);
+  ConvBankSink<0>             snk    (.out = out, .pass = pass);
+}
+
+
+/* ================================================================
+  9. ConvLayer, runtime weights, K=1 identity with linear activation
+  ================================================================ */
+
+template<pint DUMMY>
+defproc ConvLayerSrc (chan!(math::fixpoint<8,8>) pixel_in[1])
+{
+  math::fixpoint<8,8> v[16];
+  chp {
+    (;i: 16: v[i].set(v[i].const(i * 1.0)));
+    (;i: 16: pixel_in[0]!v[i])
+  }
+}
+
+
+template<pint DUMMY>
+defproc ConvLayerSink4 (chan?(math::fixpoint<8,8>) feat_out[1]; chan!(bool) pass)
+{
+  math::fixpoint<8,8> v, exp[4], eps, negone, diff, adiff;
+  bool ok;
+
+  chp {
+    eps.set(eps.const(0.02));
+    negone.set(negone.const(-1.0));
+    exp[0].set(exp[0].const(0.0));
+    exp[1].set(exp[1].const(1.0));
+    exp[2].set(exp[2].const(2.0));
+    exp[3].set(exp[3].const(3.0));
+    ok := true;
+
+    (;i: 4:
+      feat_out[0]?v;
+      diff := v - exp[i];
+      [ ~diff.negative() -> adiff := diff [] else -> adiff := negone * diff ];
+      diff := eps - adiff;
+      [ diff.negative() -> ok := false [] else -> skip ]
+    );
+    (;_i: 12: feat_out[0]?v);
+
+    pass!ok
+  }
+}
+
+
+defproc TB_ConvLayer (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) pix[1], feat[1], w[1], b[1];
+
+  ConvLayerSource<1, 1, 1,
+                  {1.0},
+                  {0.0}>              params (.w_out = w, .b_out = b);
+  ConvLayerSrc<0>                    src    (.pixel_in = pix);
+  ConvLayer<4, 4, 1, 1, 1, 0, 0.0>   dut    (.pixel_in = pix, .w_in = w,
+                                             .b_in = b, .feat_out = feat);
+  ConvLayerSink4<0>                  snk    (.feat_out = feat, .pass = pass);
+}
+
+
+/* ================================================================
+  10. End-to-end small CNN path
+  ================================================================ */
+
+defproc MiniCNN (chan?(math::fixpoint<8,8>) pixel_in[1];
+                 chan!(math::fixpoint<8,8>) class_out[2])
+{
+  chan(math::fixpoint<8,8>) conv_out[2];
+  chan(math::fixpoint<8,8>) pool_out[2];
+  chan(math::fixpoint<8,8>) flat_out[8];
+  chan(math::fixpoint<8,8>) conv_w[8], conv_b[2];
+  chan(math::fixpoint<8,8>) fc_w[16], fc_b[2];
+
+  ConvLayerSource<2, 1, 2,
+                  { 0.25,  0.25,
+                    0.25,  0.25,
+                    1.00, -1.00,
+                    1.00, -1.00 },
+                  { 0.0, 0.0 }> conv_params (conv_w, conv_b);
+
+  ConvLayer<5, 5, 2, 1, 2, 2, 0.0> conv (
+    pixel_in, conv_w, conv_b, conv_out
+  );
+
+  MaxPool<2, 4, 4, 2> pool (conv_out, pool_out);
+  Flatten<2, 2, 2> flat (pool_out, flat_out);
+
+  FCLayerSource<8, 2,
+                { 1.0, 0.0, 1.0, 0.0,
+                  1.0, 0.0, 1.0, 0.0,
+                  0.0, 1.0, 0.0, 1.0,
+                  0.0, 1.0, 0.0, 1.0 },
+                { -0.5, -4.5 }> fc_params (fc_w, fc_b);
+
+  FCLayer<8, 2, 1, 0.0> fc (flat_out, fc_w, fc_b, class_out);
+}
+
+
+template<pint DUMMY>
+defproc MiniCNNSrc (chan!(math::fixpoint<8,8>) pixel_out[1])
+{
+  math::fixpoint<8,8> one, zero;
+  chp {
+    one.set(one.const(1.0));
+    zero.set(zero.const(0.0));
+
+    (;r: 5:
+      pixel_out[0]!one;
+      pixel_out[0]!one;
+      pixel_out[0]!zero;
+      pixel_out[0]!zero;
+      pixel_out[0]!zero
+    )
+  }
+}
+
+
+template<pint DUMMY>
+defproc MiniCNNSink (chan?(math::fixpoint<8,8>) class_out[2]; chan!(bool) pass)
+{
+  math::fixpoint<8,8> c0, c1, half, diff;
+  bool b0, b1, ok;
+
+  chp {
+    half.set(half.const(0.5));
+    class_out[0]?c0;
+    class_out[1]?c1;
+
+    diff := c0 - half;
+    [ ~diff.negative() -> b0 := true [] else -> b0 := false ];
+    diff := c1 - half;
+    [ ~diff.negative() -> b1 := true [] else -> b1 := false ];
+
+    ok := b0 & ~b1;
+    pass!ok
+  }
+}
+
+
+defproc TB_MiniCNN (chan!(bool) pass)
+{
+  chan(math::fixpoint<8,8>) pix[1], class_out[2];
+
+  MiniCNN dut (.pixel_in = pix, .class_out = class_out);
+  MiniCNNSrc<0> src (.pixel_out = pix);
+  MiniCNNSink<0> snk (.class_out = class_out, .pass = pass);
+}
+
+
+/* ================================================================
+  Main
+  ================================================================ */
+
+defproc Main ()
+{
+  chan(bool) p[10];
+  bool r[10];
+
+  TB_Activation      t0 (.pass = p[0]);
+  TB_WindowAssembler t1 (.pass = p[1]);
+  TB_WinFork         t2 (.pass = p[2]);
+  TB_MaxPool         t3 (.pass = p[3]);
+  TB_MaxPoolCh       t4 (.pass = p[4]);
+  TB_Flatten         t5 (.pass = p[5]);
+  TB_FCLayer         t6 (.pass = p[6]);
+  TB_ConvBank        t7 (.pass = p[7]);
+  TB_ConvLayer       t8 (.pass = p[8]);
+  TB_MiniCNN         t9 (.pass = p[9]);
+
+  chp {
+    p[0]?r[0]; log("Activation/ReLU      : ", r[0]);
+    p[1]?r[1]; log("WindowAssembler      : ", r[1]);
+    p[2]?r[2]; log("WinFork              : ", r[2]);
+    p[3]?r[3]; log("MaxPool              : ", r[3]);
+    p[4]?r[4]; log("MaxPoolCh            : ", r[4]);
+    p[5]?r[5]; log("Flatten              : ", r[5]);
+    p[6]?r[6]; log("FCLayer              : ", r[6]);
+    p[7]?r[7]; log("ConvBank             : ", r[7]);
+    p[8]?r[8]; log("ConvLayer            : ", r[8]);
+    p[9]?r[9]; log("MiniCNN              : ", r[9])
+  }
+}

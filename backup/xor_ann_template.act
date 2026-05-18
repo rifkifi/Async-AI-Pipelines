@@ -1,0 +1,218 @@
+/* =============================================================
+  xor_ann.act - XOR Artificial Neural Network
+
+  Architecture:
+    x0_in, x1_in -> two hidden neurons -> two output neurons
+
+  Activation:
+    Each neuron computes a fixed-point weighted sum and outputs true
+    when the accumulator is non-negative, otherwise false.
+
+  Weights:
+    Fully-connected layer weights and biases are template preal arrays. Each
+    layer converts them to math::fixpoint<8,8> before entering its CHP loop.
+
+    h0: step( 5.0*x0 + 5.0*x1 - 3.0)    OR-like hidden unit
+    h1: step( 5.0*x0 + 5.0*x1 - 8.0)    AND-like hidden unit
+    o0: step( 5.0*h0 - 5.0*h1 - 2.0)    XOR output
+    o1: step(-5.0*h0 + 5.0*h1 + 2.0)    XNOR output
+
+  Expected truth table:
+    x0 x1 | h0 h1 | xor_out | xnor_out
+     0  0 |  0  0 |   0     | 1
+     0  1 |  1  0 |   1     | 0
+     1  0 |  1  0 |   1     | 0
+     1  1 |  1  1 |   0     | 1
+ ============================================================= */
+
+import "math/fxp.act";
+
+/* -------------------------------------------------------------
+ BoolToFixed
+   Converts a bool token to a math::fixpoint<8,8> token:
+   true becomes 1.0 and false becomes 0.0. 
+ ------------------------------------------------------------- */
+
+defproc BoolToFixed (chan?(bool) in; chan!(math::fixpoint<8,8>) out)
+{
+  bool v;
+  math::fixpoint<8,8> o;
+  chp {
+    *[
+      in?v;
+      [ v  -> o.set(o.const(1.0)); out!o
+      [] ~v -> o.set(o.const(0.0)); out!o
+      ]
+    ]
+  }
+}
+
+
+/* -------------------------------------------------------------
+ FCLayer <N_IN, N_OUT; W, B>
+
+   Template parameters:
+     N_IN    - number of input activations
+     N_OUT   - number of output neurons
+     W       - flattened weights, indexed as W[j*N_IN + i]
+     B       - per-neuron bias terms
+
+   Port interface:
+     x       - input channels carrying math::fixpoint<8,8> values
+     y       - output channels carrying bool activations
+
+   Behaviour:
+     The preal template values are converted to fixed-point values once.
+     For each input vector, the layer computes every output neuron:
+       acc[j] := sum_i W[j*N_IN + i]*x[i] + B[j]
+       y[j]!true if acc[j] is non-negative, else y[j]!false
+
+   The CHP loop keeps consuming one full input vector and producing one output
+   token per neuron.
+ ------------------------------------------------------------- */
+
+template<pint N_IN, N_OUT; preal W[N_OUT*N_IN], B[N_OUT]>
+defproc FCLayer (chan?(math::fixpoint<8,8>) x[N_IN]; chan!(bool) y[N_OUT])
+{
+  math::fixpoint<8,8> vx[N_IN], acc[N_OUT], wf[N_OUT*N_IN], bf[N_OUT];
+  int k;
+
+  chp {
+    (;j: N_OUT:
+      bf[j].set(bf[j].const(B[j]));
+      (;i: N_IN:
+        wf[j*N_IN + i].set(wf[j*N_IN + i].const(W[j*N_IN + i]))
+      )
+    );
+
+    *[
+      (;i: N_IN: x[i]?vx[i]);
+
+      (;j: N_OUT:
+        acc[j] := bf[j];
+        k := 0;
+        *[ k < N_IN ->
+          acc[j] := acc[j] + wf[j*N_IN + k] * vx[k];
+          k := k + 1
+        ];
+        [ ~acc[j].negative() -> y[j]!true
+        [] else -> y[j]!false
+        ]
+      )
+    ]
+  }
+}
+
+
+/* -------------------------------------------------------------
+ XOR_ANN
+   Top-level ANN process wiring the two layers together.
+ ------------------------------------------------------------- */
+
+defproc XOR_ANN (chan?(math::fixpoint<8,8>) x0_in, x1_in;
+                 chan!(bool)   xor_out, xnor_out)
+{
+  // ---- Internal channels ----
+
+  // Input vector for the output layer
+  chan(math::fixpoint<8,8>) output_in[2];
+
+  // Hidden-layer raw bool outputs
+  chan(bool) hidden_out[2];
+
+
+  // ---- Hidden layer: 2-input, 2-output fully connected layer ----
+  //
+  //   h0  step( 5.0*x0 + 5.0*x1 - 3.0 )   at least one input high
+  //   h1  step( 5.0*x0 + 5.0*x1 - 8.0 )   both inputs high
+  //
+  FCLayer<2, 2,
+          { 5.0,  5.0,
+            5.0,  5.0 },
+          { -3.0, -8.0 }> hidden_layer;
+  hidden_layer.x[0] = x0_in;
+  hidden_layer.x[1] = x1_in;
+  hidden_layer.y[0..1] = hidden_out[0..1];
+
+
+  // ---- Convert bool activations to math::fixpoint<8,8> ----
+  BoolToFixed b2i_h0 (hidden_out[0], output_in[0]);
+  BoolToFixed b2i_h1 (hidden_out[1], output_in[1]);
+
+
+  // ---- Output layer: 2-input, 2-output fully connected layer ----
+  //
+  //   o0  step( 5.0*h0 - 5.0*h1 - 2.0 )   XOR output
+  //   o1  step(-5.0*h0 + 5.0*h1 + 2.0 )   XNOR output
+  //
+  FCLayer<2, 2,
+          {  5.0, -5.0,
+            -5.0,  5.0 },
+          { -2.0,  2.0 }> output_layer;
+  output_layer.x[0..1] = output_in[0..1];
+  output_layer.y[0] = xor_out;
+  output_layer.y[1] = xnor_out;
+}
+
+
+/* -------------------------------------------------------------
+ Testbench
+   Drives all four fixed-point input combinations in sequence,
+   receives both output tokens, and logs the boolean results.
+ ------------------------------------------------------------- */
+
+defproc Testbench (chan!(math::fixpoint<8,8>) x0, x1;
+                   chan?(bool)   xor_out, xnor_out)
+{
+  bool xv, nv;
+  math::fixpoint<8,8> a, b;
+  chp {
+    // ---- test vector (0, 0) ----
+    a.set(a.const(0.0)); b.set(b.const(0.0));
+    x0!a, x1!b;
+    xor_out?xv, xnor_out?nv;       
+
+    log("Output values xor: ", xv);
+    log("Output values xnor: ", nv);
+
+    // ---- test vector (0, 1) ----
+    a.set(a.const(0.0)); b.set(b.const(1.0));
+    x0!a, x1!b;
+    xor_out?xv, xnor_out?nv;       
+
+    log("Output values xor: ", xv);
+    log("Output values xnor: ", nv);
+
+    // ---- test vector (1, 0) ----
+    a.set(a.const(1.0)); b.set(b.const(0.0));
+    x0!a, x1!b;
+    xor_out?xv, xnor_out?nv;       
+
+    log("Output values xor: ", xv);
+    log("Output values xnor: ", nv);
+
+    // ---- test vector (1, 1) ----
+    a.set(a.const(1.0)); b.set(b.const(1.0));
+    x0!a, x1!b;
+    xor_out?xv, xnor_out?nv;       
+
+    log("Output values xor: ", xv);
+    log("Output values xnor: ", nv)
+  }
+}
+
+
+/* -------------------------------------------------------------
+ test
+   Instantiates the network and the testbench, connecting them
+   through the four shared channels.
+ ------------------------------------------------------------- */
+
+defproc test ()
+{
+  chan(math::fixpoint<8,8>) x0, x1;
+  chan(bool)   xor_out, xnor_out;
+
+  XOR_ANN   ann (x0, x1, xor_out, xnor_out);
+  Testbench tb  (x0, x1, xor_out, xnor_out);
+}

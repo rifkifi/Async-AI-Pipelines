@@ -1,0 +1,109 @@
+/* ================================================================
+  test_cnn_layers.act
+
+  Simple CNN test for nn_layers_runtime_params.act.
+ ================================================================ */
+
+import "nn_layers_runtime_params.act";
+
+
+defproc SimpleCNN (chan?(math::fixpoint<8,8>) pixel_in[1];
+                   chan!(math::fixpoint<8,8>) class_out[2])
+{
+  chan(math::fixpoint<8,8>) conv_out[2];
+  chan(math::fixpoint<8,8>) pool_out[2];
+  chan(math::fixpoint<8,8>) flat_out[8];
+
+  chan(math::fixpoint<8,8>) conv_w[8];
+  chan(math::fixpoint<8,8>) conv_b[2];
+  chan(math::fixpoint<8,8>) fc_w[16];
+  chan(math::fixpoint<8,8>) fc_b[2];
+
+  ConvLayerSource<2, 1, 2,
+                  { 0.25,  0.25,
+                    0.25,  0.25,
+                    1.00, -1.00,
+                    1.00, -1.00 },
+                  { 0.0, 0.0 }> conv_params (conv_w, conv_b);
+
+  ConvLayer<5, 5, 2, 1, 2, 2, 0.0> conv1 (
+    pixel_in, conv_w, conv_b, conv_out
+  );
+
+  MaxPool<2, 4, 4, 2> pool1 (conv_out, pool_out);
+  Flatten<2, 2, 2> flat1 (pool_out, flat_out);
+
+  FCLayerSource<8, 2,
+                { 1.0, 0.0, 1.0, 0.0,
+                  1.0, 0.0, 1.0, 0.0,
+                  0.0, 1.0, 0.0, 1.0,
+                  0.0, 1.0, 0.0, 1.0 },
+                { -0.5, -4.5 }> fc_params (fc_w, fc_b);
+
+  FCLayer<8, 2, 1, 0.0> fc1 (
+    flat_out, fc_w, fc_b, class_out
+  );
+}
+
+
+defproc CNNTestbench (chan!(math::fixpoint<8,8>) pixel_out[1];
+                      chan?(math::fixpoint<8,8>) class_out[2])
+{
+  math::fixpoint<8,8> v, half, c0, c1, diff;
+  bool b0, b1;
+
+  chp {
+    half.set(half.const(0.5));
+
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(1.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+    v.set(v.const(0.0)); pixel_out[0]!v;
+
+    class_out[0]?c0;
+    class_out[1]?c1;
+
+    diff := c0 - half;
+    [ ~diff.negative() -> b0 := true [] else -> b0 := false ];
+    diff := c1 - half;
+    [ ~diff.negative() -> b1 := true [] else -> b1 := false ];
+
+    log("class_out[0] = ", b0);
+    log("class_out[1] = ", b1)
+  }
+}
+
+
+defproc test ()
+{
+  chan(math::fixpoint<8,8>) pixel[1];
+  chan(math::fixpoint<8,8>) class_out[2];
+
+  SimpleCNN dut (pixel, class_out);
+  CNNTestbench tb (pixel, class_out);
+}

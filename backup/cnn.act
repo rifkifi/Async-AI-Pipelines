@@ -1,0 +1,963 @@
+/* ================================================================
+  cnn.act  —  Convolutional Neural Network in ACT
+  Language : ACT (Asynchronous Circuit Tools)
+  Protocol : 4-phase handshaking (QDI)
+
+  ── Pipeline overview ────────────────────────────────────────
+
+  pixel stream (row-major)
+       │
+  ┌────▼──────────────────────────────────────────────────────┐
+  │  WindowAssembler<IMG_W, IMG_H, K>                         │
+  │  Buffers K rows; emits one K×K window per valid position  │
+  └────┬──────────────────────────────────────────────────────┘
+       │  K×K window tokens
+       │
+  ┌────▼──────────────────────────────────────────────────────┐
+  │  WinFork<N_OUT, K>                                        │
+  │  Replicates each window to N_OUT parallel ConvUnits       │
+  └────┬──────────────────────────────────────────────────────┘
+       │  one copy per filter
+       │
+  ┌────▼──────────────────────────────────────────────────────┐
+  │  ConvUnit<K, ACT_FN; PW, PC, NW, NC>   (×N_OUT)           │
+  │  Dot-product of window and weights + bias + activation    │
+  └────┬──────────────────────────────────────────────────────┘
+       │  N_OUT activation streams
+       │
+  ┌────▼──────────────────────────────────────────────────────┐
+  │  MaxPool2x2<N_OUT, OUT_W, OUT_H>                          │
+  │  2×2 max-pooling, stride 2, per feature-map channel       │
+  └────┬──────────────────────────────────────────────────────┘
+       │  N_OUT pooled streams
+       │
+  ┌────▼──────────────────────────────────────────────────────┐
+  │  Flatten<N_OUT, POOL_H, POOL_W>                           │
+  │  Serialises all feature-map pixels into one 1-D stream    │
+  └────┬──────────────────────────────────────────────────────┘
+       │  single int<8> stream
+       │
+  ┌────▼──────────────────────────────────────────────────────┐
+  │  FCLayer<N_IN, N_OUT, ACT_FN; PW, PC, NW, NC>            │
+  │  Fully-connected layer (from ann_layer template)           │
+  └────┬──────────────────────────────────────────────────────┘
+       │  class scores
+
+  ── Unsigned-arithmetic convention ──────────────────────────
+  ACT int<N> is unsigned.  Signed weights are expressed by
+  splitting the dot-product into positive (PW) and negative
+  (NW) sides and comparing them:
+
+    step / relu ( Σ w_i · x_i + bias )
+  = step / relu ( pos_sum − neg_sum )
+  where
+    pos_sum = Σ PW[i]·x[i] + PC      (all ≥ 0)
+    neg_sum = Σ NW[i]·x[i] + NC      (all ≥ 0)
+
+  ── Activation function codes ────────────────────────────────
+    0  ACT_STEP   Heaviside step  (output: 0 or 1)
+    1  ACT_RELU   Rectified Linear Unit, clamped to [0, 127]
+    2  ACT_LRELU  Leaky ReLU, negative slope ≈ 1/8
+ ================================================================ */
+
+/* ----------------------------------------------------------------
+  Activation functions
+ ---------------------------------------------------------------- */
+pint ACT_STEP  = 0;
+pint ACT_RELU  = 1;
+pint ACT_LRELU = 2;
+
+
+/* ----------------------------------------------------------------
+  IntFork<N>
+  Receives one int<8> token and sends it to N output channels
+  simultaneously.
+ ---------------------------------------------------------------- */
+
+template<pint N>
+defproc IntFork (chan?(int<8>) in; chan!(int<8>) out[N])
+{
+  int<8> t;
+  chp {
+    *[ in?t; log("IntFork recv ", t); (,j:N: out[j]!t); log("IntFork sent ", t) ]
+  }
+}
+
+
+/* ----------------------------------------------------------------
+  WindowAssembler<IMG_W, IMG_H, K>
+
+  Converts a flat row-major pixel stream into a sequence of
+  K×K sliding windows (valid convolution, stride 1).
+
+  Input  : one int<8> channel carrying IMG_H × IMG_W pixels
+  Output : K×K = K*K int<8> channels  (sent in parallel)
+
+  Produces (IMG_H − K + 1) × (IMG_W − K + 1) windows total.
+
+  Internal state:
+    buf[K][IMG_W]  —  circular row buffer  (K rows)
+    rptr           —  write pointer into circular buffer (mod K)
+    row_idx        —  absolute row being filled (0 … IMG_H-1)
+    col_idx        —  column being filled  (0 … IMG_W-1)
+
+  Window element  (kr, kc)  after writing  (row_idx, col_idx):
+    row  buf[(rptr + kr + 1) mod K]
+    col  col_idx − K + 1 + kc
+  Valid when row_idx ≥ K-1  AND  col_idx ≥ K-1.
+ ---------------------------------------------------------------- */
+
+template<pint IMG_W, IMG_H, K>
+defproc WindowAssembler (chan?(int<8>) pix_in;
+                         chan!(int<8>) win[K*K])
+{
+  int<8>  buf[K][IMG_W];
+  int<8>  px;
+  int<16> row_idx, col_idx, rptr, start_col;
+
+  chp {
+    log("WindowAssembler start");
+    row_idx := 0;  col_idx := 0;  rptr := 0;
+
+    *[ row_idx < IMG_H ->
+
+       *[ col_idx < IMG_W ->
+
+          // 1. Receive next pixel into circular buffer
+          pix_in?buf[rptr][col_idx];
+          log("WindowAssembler pixel row ", row_idx, " col ", col_idx, " val ", buf[rptr][col_idx]);
+
+          // 2. Emit window when buffer holds ≥K rows and ≥K columns
+          [ (row_idx >= (K-1)) & (col_idx >= (K-1)) ->
+              start_col := col_idx + 1 - K;
+              log("WindowAssembler emit row ", row_idx, " start_col ", start_col);
+              (,kr:K:
+                (,kc:K:
+                  win[kr*K + kc]!buf[(rptr + kr + 1) % K]
+                                    [start_col + kc]
+                )
+              )
+          [] (row_idx < (K-1)) | (col_idx < (K-1)) ->
+              skip
+          ];
+
+          col_idx := col_idx + 1
+       ];
+
+       // End of row: advance circular pointer and row counter
+       col_idx := 0;
+       rptr    := (rptr + 1) % K;
+       row_idx := row_idx + 1
+    ]
+  }
+}
+
+
+/* ----------------------------------------------------------------
+  WinFork<N_OUT, K>
+
+  Receives one K×K window (K*K parallel int<8> tokens) and
+  replicates it to N_OUT sets of output channels.
+  Used to broadcast each sliding window to every conv filter.
+
+  Internally holds the window in registers until all N_OUT
+  consumers have received their copy.
+ ---------------------------------------------------------------- */
+
+template<pint N_OUT, K>
+defproc WinFork (chan?(int<8>) win_in[K*K];
+                 chan!(int<8>) win_out[N_OUT][K*K])
+{
+  int<8> buf[K*K];
+
+  chp {
+    *[
+      // Receive the full window
+      (,k: K*K: win_in[k]?buf[k]);
+      log("WinFork recv window first ", buf[0]);
+
+      // Replicate to all N_OUT outputs simultaneously
+      (,f: N_OUT:
+        (,k: K*K: win_out[f][k]!buf[k])
+      );
+      log("WinFork sent window")
+    ]
+  }
+}
+
+
+/* ----------------------------------------------------------------
+  ConvUnit<K, ACT_FN; PW[K*K], PC; NW[K*K], NC>
+
+  Implements one convolutional filter on a single-channel K×K
+  window.  For multi-channel inputs, chain ConvAccum first
+  (see ConvUnitMC below).
+
+  Template parameters  (compile-time constants):
+    K        filter (kernel) size  —  window is K×K
+    ACT_FN   activation code  (0=Step, 1=ReLU, 2=LReLU)
+    PW[K*K]  positive-side weights  (≥ 0)
+    PC       positive-side bias     (≥ 0)
+    NW[K*K]  negative-side weights  (≥ 0)
+    NC       negative-side bias     (≥ 0)
+
+  Behaviour per token:
+    1. Receive K*K pixels in parallel.
+    2. pos ← Σ PW[k]·px[k] + PC
+       neg ← Σ NW[k]·px[k] + NC
+    3. Apply activation to (pos − neg) and send output.
+---------------------------------------------------------------- */
+
+template<pint K, ACT_FN;
+         pint PW[K*K], PC;
+         pint NW[K*K], NC>
+defproc ConvUnit (chan?(int<8>) win[K*K];
+                  chan!(int<8>) out)
+{
+  int<8>  px[K*K];
+  int<16> pos, neg, diff;
+
+  chp {
+    *[
+      // 1. Receive window pixels
+      (,k: K*K: win[k]?px[k]);
+      log("ConvUnit recv first ", px[0]);
+
+      // 2. Accumulate positive and negative sides
+      pos := (+ k: K*K: PW[k] * px[k]) + PC;
+      neg := (+ k: K*K: NW[k] * px[k]) + NC;
+
+      // 3. Activation (compile-time branch on ACT_FN)
+      [ ACT_FN = 0 ->           // ── Step ──────────────────────
+          [ pos >= neg -> out!1
+          [] pos  < neg -> out!0
+          ];
+          log("ConvUnit step pos ", pos, " neg ", neg)
+
+      [] ACT_FN = 1 ->           // ── ReLU ─────────────────────
+          [ pos >= neg ->
+              diff := pos - neg;
+              [ diff > 127 -> out!127
+              [] diff <= 127 -> out!diff
+              ]
+          [] pos < neg -> out!0
+          ];
+          log("ConvUnit relu pos ", pos, " neg ", neg)
+
+      [] ACT_FN = 2 ->           // ── Leaky ReLU ───────────────
+          [ pos >= neg ->
+              diff := pos - neg;
+              [ diff > 127 -> out!127
+              [] diff <= 127 -> out!diff
+              ]
+          [] pos < neg ->
+              diff := neg - pos;
+              out!(diff >> 3)    // slope ≈ 0.125 in neg region
+          ];
+          log("ConvUnit lrelu pos ", pos, " neg ", neg)
+      ]
+    ]
+  }
+}
+
+
+/* ----------------------------------------------------------------
+  ConvUnitMC<K, N_IN_CH, ACT_FN; PW[N_IN_CH*K*K], PC;
+                                   NW[N_IN_CH*K*K], NC>
+
+  Multi-channel variant: sums the dot-products across all
+  N_IN_CH input channels before applying activation.
+
+  Weight layout (flattened):
+    channel ch, kernel position k  →  index  ch*K*K + k
+ ---------------------------------------------------------------- */
+ 
+template<pint K, N_IN_CH, ACT_FN;
+         pint PW[N_IN_CH*K*K], PC;
+         pint NW[N_IN_CH*K*K], NC>
+defproc ConvUnitMC (chan?(int<8>) win[N_IN_CH][K*K];
+                    chan!(int<8>) out)
+{
+  int<8>  px[N_IN_CH][K*K];
+  int<16> pos, neg, diff;
+
+  chp {
+    *[
+      // 1. Receive windows from all input channels in parallel
+      (,ch: N_IN_CH: (,k: K*K: win[ch][k]?px[ch][k]));
+      log("ConvUnitMC recv first ", px[0][0]);
+
+      // 2. Accumulate across all channels
+      pos := (+ ch: N_IN_CH: (+ k: K*K: PW[ch*K*K + k] * px[ch][k])) + PC;
+      neg := (+ ch: N_IN_CH: (+ k: K*K: NW[ch*K*K + k] * px[ch][k])) + NC;
+
+      // 3. Activation (same dispatch as ConvUnit)
+      [ ACT_FN = 0 ->
+          [ pos >= neg -> out!1  [] pos < neg -> out!0 ];
+          log("ConvUnitMC step pos ", pos, " neg ", neg)
+      [] ACT_FN = 1 ->
+          [ pos >= neg ->
+              diff := pos - neg;
+              [diff > 127 -> out!127 [] diff <= 127 -> out!diff]
+          [] pos < neg -> out!0
+          ];
+          log("ConvUnitMC relu pos ", pos, " neg ", neg)
+      [] ACT_FN = 2 ->
+          [ pos >= neg ->
+              diff := pos - neg;
+              [diff > 127 -> out!127 [] diff <= 127 -> out!diff]
+          [] pos < neg -> out!(( neg - pos) >> 3)
+          ];
+          log("ConvUnitMC lrelu pos ", pos, " neg ", neg)
+      ]
+    ]
+  }
+}
+
+
+/* ---------------------------------------------------------------
+  ConvBank<K, N_IN_CH, N_OUT, ACT_FN; PW[], PC[], NW[], NC[]>
+
+  Homogeneous bank for all convolution filters. This avoids making
+  a sparse array of ConvUnitMC instances with different template
+  weight specializations, which ACT rejects.
+ ---------------------------------------------------------------- */
+
+template<pint K, N_IN_CH, N_OUT, ACT_FN;
+         pint PW[N_OUT*N_IN_CH*K*K], PC[N_OUT];
+         pint NW[N_OUT*N_IN_CH*K*K], NC[N_OUT]>
+defproc ConvBank (chan?(int<8>) win[N_OUT][N_IN_CH][K*K];
+                  chan!(int<8>) out[N_OUT])
+{
+  int<8>  px[N_OUT][N_IN_CH][K*K];
+  int<16> pos[N_OUT], neg[N_OUT], diff[N_OUT];
+
+  chp {
+    *[
+      (,f: N_OUT:
+        (,ch: N_IN_CH:
+          (,k: K*K: win[f][ch][k]?px[f][ch][k])
+        )
+      );
+      log("ConvBank recv batch first ", px[0][0][0]);
+
+      (,f: N_OUT:
+        pos[f] := (+ ch: N_IN_CH:
+                    (+ k: K*K:
+                      PW[f*N_IN_CH*K*K + ch*K*K + k] * px[f][ch][k])) + PC[f],
+        neg[f] := (+ ch: N_IN_CH:
+                    (+ k: K*K:
+                      NW[f*N_IN_CH*K*K + ch*K*K + k] * px[f][ch][k])) + NC[f];
+
+        [ ACT_FN = 0 ->
+            [ pos[f] >= neg[f] -> out[f]!1
+            [] pos[f] <  neg[f] -> out[f]!0
+            ];
+            log("ConvBank step f ", f, " pos ", pos[f], " neg ", neg[f])
+        [] ACT_FN = 1 ->
+            [ pos[f] >= neg[f] ->
+                diff[f] := pos[f] - neg[f];
+                [ diff[f] > 127 -> out[f]!127
+                [] diff[f] <= 127 -> out[f]!diff[f]
+                ]
+            [] pos[f] < neg[f] -> out[f]!0
+            ];
+            log("ConvBank relu f ", f, " pos ", pos[f], " neg ", neg[f])
+        [] ACT_FN = 2 ->
+            [ pos[f] >= neg[f] ->
+                diff[f] := pos[f] - neg[f];
+                [ diff[f] > 127 -> out[f]!127
+                [] diff[f] <= 127 -> out[f]!diff[f]
+                ]
+            [] pos[f] < neg[f] ->
+                diff[f] := neg[f] - pos[f];
+                out[f]!(diff[f] >> 3)
+            ];
+            log("ConvBank lrelu f ", f, " pos ", pos[f], " neg ", neg[f])
+        ]
+      )
+    ]
+  }
+}
+
+
+/* ---------------------------------------------------------------
+  ConvLayer<IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN;
+            PW[N_OUT * N_IN_CH * K*K], PC[N_OUT];
+            NW[N_OUT * N_IN_CH * K*K], NC[N_OUT]>
+
+  Complete convolutional layer:
+    • N_IN_CH input feature-map streams (pixel-serial, row-major)
+    • N_OUT   output feature-map streams (activation-serial)
+    • K×K convolution kernel per filter per input channel
+    • Valid padding (output = IMG_H-K+1 rows × IMG_W-K+1 cols)
+
+  Internal structure (per input channel ch):
+    pixel_in[ch] → WindowAssembler → raw windows
+                                        │
+                                   WinFork to N_OUT filters
+                                        │
+                              ConvUnitMC[0..N_OUT-1]
+                                        │
+                              output[0..N_OUT-1]
+
+  Weight layout (flattened to 1-D):
+    filter f, channel ch, kernel position k
+      → PW[ f*(N_IN_CH*K*K) + ch*K*K + k ]
+---------------------------------------------------------------- */
+
+template<pint IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN;
+         pint PW[N_OUT*N_IN_CH*K*K], PC[N_OUT];
+         pint NW[N_OUT*N_IN_CH*K*K], NC[N_OUT]>
+defproc ConvLayer (chan?(int<8>) pixel_in[N_IN_CH];
+                   chan!(int<8>) feat_out[N_OUT])
+{
+  // Derived output dimensions
+  pint OUT_W = IMG_W - K + 1;
+  pint OUT_H = IMG_H - K + 1;
+
+  // ---- Window channels per input channel ----
+  // raw_win[ch][k] : pixel k of K×K window from channel ch
+  chan(int<8>) raw_win[N_IN_CH][K*K];
+
+  // ---- Forked windows: one copy per output filter ----
+  // forked[ch][f][k]
+  chan(int<8>) forked[N_IN_CH][N_OUT][K*K];
+
+  // ---- Collated windows: one [N_IN_CH][K*K] input per filter ----
+  // conv_in[f][ch][k]  — rearranged view of forked
+  chan(int<8>) conv_in[N_OUT][N_IN_CH][K*K];
+
+  // ---- One WindowAssembler per input channel ----
+  WindowAssembler<IMG_W, IMG_H, K> wa[N_IN_CH];
+  (ch: N_IN_CH:
+    wa[ch].pix_in = pixel_in[ch];
+    wa[ch].win[0..K*K-1] = raw_win[ch][0..K*K-1];
+  )
+
+  // ---- Fan-out each channel's window to all filters ----
+  WinFork<N_OUT, K> wf[N_IN_CH];
+  (ch: N_IN_CH:
+    wf[ch].win_in[0..K*K-1] = raw_win[ch][0..K*K-1];
+    wf[ch].win_out[0..N_OUT-1][0..K*K-1] = forked[ch][0..N_OUT-1][0..K*K-1];
+  )
+
+  // ---- Wire forked channels into per-filter, per-channel arrays ----
+  // conv_in[f][ch] = forked[ch][f]
+  (f: N_OUT:
+    (ch: N_IN_CH:
+      (k: K*K:
+        conv_in[f][ch][k] = forked[ch][f][k];
+      )
+    )
+  )
+
+  // ---- Homogeneous bank of multi-channel convolution filters ----
+  ConvBank<K, N_IN_CH, N_OUT, ACT_FN, PW, PC, NW, NC> conv_bank;
+  conv_bank.win[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1] =
+    conv_in[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1];
+  conv_bank.out[0..N_OUT-1] = feat_out[0..N_OUT-1];
+
+  chp {
+    log("ConvLayer start")
+  }
+}
+
+
+/* ---------------------------------------------------------------
+  MaxPool2x2<N_CH, FEAT_W, FEAT_H>
+
+  2×2 max-pooling, stride 2 (no overlap).
+  Applied independently to each of the N_CH feature-map channels.
+
+  Input : N_CH streams of FEAT_H × FEAT_W activations (row-major)
+  Output: N_CH streams of (FEAT_H/2) × (FEAT_W/2) pooled values
+
+  For each 2×2 block the maximum of the four values is forwarded.
+  FEAT_W and FEAT_H must be even.
+
+  Strategy: read two consecutive pixels in a row (p00, p01),
+  then two from the next row (p10, p11), take max of all four.
+  A simple two-row buffer of width FEAT_W is used per channel.
+---------------------------------------------------------------- */
+
+template<pint FEAT_W, FEAT_H>
+defproc MaxPool2x2Ch (chan?(int<8>) in; chan!(int<8>) out)
+{
+  int<8> buf[2][FEAT_W];
+  int<8> m;
+  int<16> col, row;
+  chp {
+    log("MaxPool2x2Ch start");
+    row := 0;
+    *[ row < FEAT_H ->
+       (; r: 2:
+         (; c: FEAT_W: in?buf[r][c])
+       );
+       col := 0;
+       *[ col < FEAT_W ->
+          m := buf[0][col];
+          [ buf[0][col+1] > m -> m := buf[0][col+1] [] else -> skip ];
+          [ buf[1][col]   > m -> m := buf[1][col]   [] else -> skip ];
+          [ buf[1][col+1] > m -> m := buf[1][col+1] [] else -> skip ];
+          out!m;
+          log("MaxPool2x2Ch out ", m);
+          col := col + 2
+       ];
+       row := row + 2
+    ]
+  }
+}
+
+template<pint N_CH, FEAT_W, FEAT_H>
+defproc MaxPool2x2 (chan?(int<8>) feat_in[N_CH];
+                    chan!(int<8>) pool_out[N_CH])
+{
+  // One pool process per channel (run in parallel)
+  (ch: N_CH:
+    // Internal sub-process for channel ch
+    /*
+    defproc PoolCh (chan?(int<8>) in; chan!(int<8>) out)
+    {
+      int<8> buf[2][FEAT_W];   // two-row buffer
+      int<8> m, v;
+      int<16> col, row;
+      chp {
+        row := 0;
+        *[ row < FEAT_H ->
+           // Fill two rows into buffer
+           (r: 2:
+             (c: FEAT_W: in?buf[r][c])
+           );
+           // Emit max of each 2×2 block (stride 2)
+           col := 0;
+           *[ col < FEAT_W ->
+              m := buf[0][col];
+              [ buf[0][col+1] > m -> m := buf[0][col+1] [] else -> skip ];
+              [ buf[1][col]   > m -> m := buf[1][col]   [] else -> skip ];
+              [ buf[1][col+1] > m -> m := buf[1][col+1] [] else -> skip ];
+              out!m;
+              col := col + 2
+           ];
+           row := row + 2
+        ]
+      }
+    }
+    */
+    MaxPool2x2Ch<FEAT_W, FEAT_H> pool_ch[ch..ch];
+    pool_ch[ch].in = feat_in[ch];
+    pool_ch[ch].out = pool_out[ch];
+  )
+
+  chp {
+    log("MaxPool2x2 start")
+  }
+}
+
+
+/* ---------------------------------------------------------------
+  AvgPool2x2<N_CH, FEAT_W, FEAT_H>
+
+  2×2 average-pooling, stride 2.
+  Output is the integer average (floor) of the four values.
+---------------------------------------------------------------- */
+
+template<pint FEAT_W, FEAT_H>
+defproc AvgPool2x2Ch (chan?(int<8>) in; chan!(int<8>) out)
+{
+  int<8>  buf[2][FEAT_W];
+  int<16> col, row, s;
+  chp {
+    log("AvgPool2x2Ch start");
+    row := 0;
+    *[ row < FEAT_H ->
+       (; r: 2: (; c: FEAT_W: in?buf[r][c]));
+       col := 0;
+       *[ col < FEAT_W ->
+          s := buf[0][col] + buf[0][col+1]
+             + buf[1][col] + buf[1][col+1];
+          out!(s >> 2);
+          log("AvgPool2x2Ch out ", (s >> 2));
+          col := col + 2
+       ];
+       row := row + 2
+    ]
+  }
+}
+
+template<pint N_CH, FEAT_W, FEAT_H>
+defproc AvgPool2x2 (chan?(int<8>) feat_in[N_CH];
+                    chan!(int<8>) pool_out[N_CH])
+{
+  (ch: N_CH:
+    /*
+    defproc AvgCh (chan?(int<8>) in; chan!(int<8>) out)
+    {
+      int<8>  buf[2][FEAT_W];
+      int<16> col, row, s;
+      chp {
+        row := 0;
+        *[ row < FEAT_H ->
+           (r: 2: (c: FEAT_W: in?buf[r][c]));
+           col := 0;
+           *[ col < FEAT_W ->
+              s := buf[0][col] + buf[0][col+1]
+                 + buf[1][col] + buf[1][col+1];
+              out!(s >> 2);        // divide by 4
+              col := col + 2
+           ];
+           row := row + 2
+        ]
+      }
+    }
+    */
+    AvgPool2x2Ch<FEAT_W, FEAT_H> avg_ch[ch..ch];
+    avg_ch[ch].in = feat_in[ch];
+    avg_ch[ch].out = pool_out[ch];
+  )
+
+  chp {
+    log("AvgPool2x2 start")
+  }
+}
+
+
+/* ---------------------------------------------------------------
+  Flatten<N_CH, FEAT_H, FEAT_W>
+
+  Serialises N_CH feature-map streams (each FEAT_H × FEAT_W
+  activations) into one single int<8> output stream.
+
+  Output order: channel 0 row-major, then channel 1, …, channel N_CH-1.
+  Total tokens output per image: N_CH × FEAT_H × FEAT_W.
+---------------------------------------------------------------- */
+
+template<pint N_CH, FEAT_H, FEAT_W>
+defproc Flatten (chan?(int<8>) feat_in[N_CH];
+                 chan!(int<8>) flat_out)
+{
+  int<8>  v;
+  chp {
+    *[
+      (; ch: N_CH:
+        (; r: FEAT_H:
+          (; c: FEAT_W:
+             feat_in[ch]?v;
+             flat_out!v;
+             log("Flatten ch ", ch, " val ", v)
+          )
+        )
+      )
+    ]
+  }
+}
+
+
+/* ---------------------------------------------------------------
+  GenNeuron<N_IN, ACT_FN; PW[N_IN], PC; NW[N_IN], NC>
+
+  Fully-connected neuron.  Reads N_IN activations in parallel,
+  computes weighted sum, applies activation, outputs one value.
+
+  Reused both in FCLayer and can be used directly.
+---------------------------------------------------------------- */
+
+template<pint N_IN, ACT_FN;
+         pint PW[N_IN], PC;
+         pint NW[N_IN], NC>
+defproc GenNeuron (chan?(int<8>) x[N_IN]; chan!(int<8>) y)
+{
+  int<8>  vx[N_IN];
+  int<16> pos, neg, diff;
+
+  chp {
+    *[
+      (,i: N_IN: x[i]?vx[i]);
+      log("FCBank recv first ", vx[0]);
+      pos := (+ i: N_IN: PW[i] * vx[i]) + PC;
+      neg := (+ i: N_IN: NW[i] * vx[i]) + NC;
+      [ ACT_FN = 0 ->
+          [pos >= neg -> y!1 [] pos < neg -> y!0]
+      [] ACT_FN = 1 ->
+          [pos >= neg ->
+             diff := pos - neg;
+             [diff > 127 -> y!127 [] diff <= 127 -> y!diff]
+           [] pos < neg -> y!0]
+      [] ACT_FN = 2 ->
+          [pos >= neg ->
+             diff := pos - neg;
+             [diff > 127 -> y!127 [] diff <= 127 -> y!diff]
+           [] pos < neg -> y!((neg - pos) >> 3)]
+      ]
+    ]
+  }
+}
+
+
+/* ---------------------------------------------------------------
+  FCBank<N_IN, N_OUT, ACT_FN; PW[], PC[], NW[], NC[]>
+
+  Homogeneous fully-connected neuron bank. It keeps all neurons in
+  one process type so ACT does not create a sparse array with
+  different GenNeuron template specializations per output.
+---------------------------------------------------------------- */
+
+template<pint N_IN, N_OUT, ACT_FN;
+         pint PW[N_OUT*N_IN], PC[N_OUT];
+         pint NW[N_OUT*N_IN], NC[N_OUT]>
+defproc FCBank (chan?(int<8>) x[N_IN]; chan!(int<8>) y[N_OUT])
+{
+  int<8>  vx[N_IN];
+  int<16> pos[N_OUT], neg[N_OUT], diff[N_OUT];
+
+  chp {
+    *[
+      (,i: N_IN: x[i]?vx[i]);
+
+      (,j: N_OUT:
+        pos[j] := (+ i: N_IN: PW[j*N_IN + i] * vx[i]) + PC[j],
+        neg[j] := (+ i: N_IN: NW[j*N_IN + i] * vx[i]) + NC[j];
+
+        [ ACT_FN = 0 ->
+            [ pos[j] >= neg[j] -> y[j]!1
+            [] pos[j] <  neg[j] -> y[j]!0
+            ];
+            log("FCBank step j ", j, " pos ", pos[j], " neg ", neg[j])
+        [] ACT_FN = 1 ->
+            [ pos[j] >= neg[j] ->
+                diff[j] := pos[j] - neg[j];
+                [ diff[j] > 127 -> y[j]!127
+                [] diff[j] <= 127 -> y[j]!diff[j]
+                ]
+            [] pos[j] < neg[j] -> y[j]!0
+            ];
+            log("FCBank relu j ", j, " pos ", pos[j], " neg ", neg[j])
+        [] ACT_FN = 2 ->
+            [ pos[j] >= neg[j] ->
+                diff[j] := pos[j] - neg[j];
+                [ diff[j] > 127 -> y[j]!127
+                [] diff[j] <= 127 -> y[j]!diff[j]
+                ]
+            [] pos[j] < neg[j] ->
+                diff[j] := neg[j] - pos[j];
+                y[j]!(diff[j] >> 3)
+            ];
+            log("FCBank lrelu j ", j, " pos ", pos[j], " neg ", neg[j])
+        ]
+      )
+    ]
+  }
+}
+
+
+/* ---------------------------------------------------------------
+  FCLayer<N_IN, N_OUT, ACT_FN;
+          PW[N_OUT*N_IN], PC[N_OUT];
+          NW[N_OUT*N_IN], NC[N_OUT]>
+
+  Fully-connected layer: N_OUT neurons each reading N_IN inputs.
+  Accepts inputs as a single serialised stream (not parallel),
+  buffers them, then fires all N_OUT neurons simultaneously.
+
+  Weight layout:  neuron j, input i  →  PW[ j*N_IN + i ]
+---------------------------------------------------------------- */
+
+template<pint N_IN, N_OUT, ACT_FN;
+         pint PW[N_OUT*N_IN], PC[N_OUT];
+         pint NW[N_OUT*N_IN], NC[N_OUT]>
+defproc FCLayer (chan?(int<8>) flat_in;
+                 chan!(int<8>) out[N_OUT])
+{
+  // Buffer the N_IN inputs so all neurons can read them
+  chan(int<8>) buf_ch[N_IN];      // broadcast channels to neurons
+  int<8>       buf[N_IN];
+  int<16>      idx;
+
+  // Input collector: fills buf, then broadcasts N_OUT copies
+  // one at a time along buf_ch[i]
+  chp {
+    *[
+      // Receive N_IN values from flat stream
+      idx := 0;
+      *[ idx < N_IN -> flat_in?buf[idx]; idx := idx+1 ];
+      log("FCLayer buffered first ", buf[0]);
+
+      // Fan-out each buffered value to all N_OUT neurons
+      // via per-input fork channels
+      (,i: N_IN: buf_ch[i]!buf[i]);
+      log("FCLayer broadcast")
+    ]
+  }
+
+  // Homogeneous neuron bank for all outputs.
+  FCBank<N_IN, N_OUT, ACT_FN, PW, PC, NW, NC> fc_bank;
+  fc_bank.x[0..N_IN-1] = buf_ch[0..N_IN-1];
+  fc_bank.y[0..N_OUT-1] = out[0..N_OUT-1];
+}
+
+
+/* ---------------------------------------------------------------
+  SimpleCNN
+
+  Demonstrates a small but complete CNN:
+
+    Input:  8×8 grayscale image, 1 channel
+    Conv1:  3×3 kernel, 1→4 filters, ReLU → output 6×6×4
+    Pool1:  2×2 max-pooling              → output 3×3×4  (36 values)
+    Flat:   flatten 4 × 3×3             → 36-element 1-D stream
+    FC1:    36 → 8 neurons, ReLU
+    FC2:    8  → 4 neurons, Step (class scores 0 or 1)
+
+  All weights below are illustrative zeros/ones.
+  Replace with quantised trained weights for real inference.
+
+  Derived constants:
+    OUT_W1 = 8 - 3 + 1 = 6    (conv1 output width)
+    OUT_H1 = 8 - 3 + 1 = 6    (conv1 output height)
+    POOL_W = 6 / 2     = 3    (after 2×2 max-pool)
+    POOL_H = 6 / 2     = 3
+    FLAT_N = 4 × 3 × 3 = 36
+---------------------------------------------------------------- */
+
+defproc SimpleCNN (chan?(int<8>) pixel_in;
+                     chan!(int<8>) class_out[4])
+{
+  // ---- Feature-map channels between layers ----
+  chan(int<8>) conv_out[4];     // Conv1  output  (4 channels, 6×6 each)
+  chan(int<8>) pool_out[4];     // Pool1  output  (4 channels, 3×3 each)
+  chan(int<8>) flat_out;        // Flat   output  (36-element stream)
+  chan(int<8>) fc1_out[8];      // FC1    output  (8 values)
+
+  // Pixel input: 1 channel — wrap in array for ConvLayer interface
+  chan(int<8>) pixel_arr[1];
+  pixel_arr[0] = pixel_in;
+
+  /* ──────────────────────────────────────────────────────────────
+    Conv1: 4 filters, 3×3, 1 input channel, ReLU
+  
+    Weight layout: filter f, channel 0, kernel k  → PW[f*9 + k]
+    Using illustrative weights (identity-like filter 0, zeros rest)
+  
+    PW for filter 0  (edge-detect like: center positive)
+      [ 0,0,0,  0,2,0,  0,0,0 ]  → PW[0..8]
+    PW for filters 1-3: all zeros (bias only)
+    PC = [0, 1, 1, 1]   (small positive bias for filters 1-3)
+    NW: all zeros    NC = [1,0,0,0] (filter 0 threshold 1)
+   ────────────────────────────────────────────────────────────── */
+
+  ConvLayer<8, 8, 3, 1, 4, 1,    // IMG_W IMG_H K N_IN N_OUT ACT_RELU
+            {0,0,0, 0,2,0, 0,0,0,  // filter 0 PW
+             0,0,0, 0,0,0, 0,0,0,  // filter 1 PW
+             0,0,0, 0,0,0, 0,0,0,  // filter 2 PW
+             0,0,0, 0,0,0, 0,0,0}, // filter 3 PW
+            {0, 1, 1, 1},          // PC[4]
+            {0,0,0, 0,0,0, 0,0,0,  // NW (all zero)
+             0,0,0, 0,0,0, 0,0,0,
+             0,0,0, 0,0,0, 0,0,0,
+             0,0,0, 0,0,0, 0,0,0},
+            {1, 0, 0, 0}>          // NC[4]
+    conv1 (pixel_arr, conv_out);
+
+  // ──────────────────────────────────────────────────────────────
+  //  MaxPool1: 2×2, stride 2  →  6×6 becomes 3×3 per channel
+  // ──────────────────────────────────────────────────────────────
+  MaxPool2x2<4, 6, 6> pool1 (conv_out, pool_out);
+
+  // ──────────────────────────────────────────────────────────────
+  //  Flatten: 4 channels × 3×3 = 36 values → serial stream
+  // ──────────────────────────────────────────────────────────────
+  Flatten<4, 3, 3> flat (pool_out, flat_out);
+
+  // ──────────────────────────────────────────────────────────────
+  //  FC1: 36 → 8, ReLU
+  //  Illustrative: identity-like (diagonal 1s, rest 0s, zero bias)
+  // ──────────────────────────────────────────────────────────────
+  FCLayer<36, 8, 1,
+          // PW[8*36]: neuron j has weight 1 at position j, 0 elsewhere
+          {1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+          {0,0,0,0,0,0,0,0},         // PC[8]
+          // NW[8*36]: all zero
+          {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+          {0,0,0,0,0,0,0,0}>         // NC[8]
+    fc1 (flat_out, fc1_out);
+
+  // ──────────────────────────────────────────────────────────────
+  //  FC2: 8 → 4, Step (binary class predictions)
+  //  Illustrative weights: neuron j fires if fc1_out[j] > 0
+  // ──────────────────────────────────────────────────────────────
+  chan(int<8>) fc1_flat;             // re-serialise fc1 outputs
+  Flatten<8, 1, 1> fc1_flat_proc (fc1_out, fc1_flat);  // trivial 1×1
+
+  FCLayer<8, 4, 0,
+          {1,0,0,0,0,0,0,0,
+           0,1,0,0,0,0,0,0,
+           0,0,1,0,0,0,0,0,
+           0,0,0,1,0,0,0,0},
+          {0,0,0,0},
+          {0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0,
+           0,0,0,0,0,0,0,0},
+           {1,1,1,1}>                 // NC threshold = 1 for step
+    fc2 (fc1_flat, class_out);
+
+  chp {
+    log("SimpleCNN start")
+  }
+}
+
+
+/* ---------------------------------------------------------------
+  Testbench
+  Feeds one 8×8 all-zero image and reads 4 class scores.
+---------------------------------------------------------------- */
+
+defproc CNN_Testbench ()
+{
+  chan(int<8>) pix_in;
+  chan(int<8>) class_out[4];
+  int<8>       px, c0, c1, c2, c3;
+  int<16>      i;
+
+  SimpleCNN cnn (pix_in, class_out);
+
+  chp {
+    // Send 64 pixels (8×8 all-zero test image)
+    log("CNN_Testbench send image");
+    i := 0;
+    *[ i < 64 -> pix_in!0; i := i+1 ];
+
+    // Receive class scores
+    class_out[0]?c0, class_out[1]?c1,
+    class_out[2]?c2, class_out[3]?c3;
+    log("CNN_Testbench class_out ", c0, " ", c1, " ", c2, " ", c3)
+  }
+}
+
+/* ---------------------------------------------------------------
+  Top 
+---------------------------------------------------------------- */
+defproc Top ()
+{
+  CNN_Testbench tb;
+
+  chp {
+    log("Top start")
+  }
+}
+
+Top test;
