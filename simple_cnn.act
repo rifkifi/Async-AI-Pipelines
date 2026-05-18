@@ -1,7 +1,7 @@
 /* ================================================================
   simple_cnn.act
 
-  Small CNN-style fixed-point pipeline built from nn_layers.act.
+  Small CNN-style fixed-point pipeline using channel-loaded layer parameters.
 
   Network:
     input image:  5x5, 1 channel
@@ -10,8 +10,8 @@
     flatten:      2 channels * 2 * 2 = 8 parallel values
     fc:           8 inputs -> 2 step-activated class outputs
 
-  This is an illustrative wiring example. Replace the weights and biases with
-  trained fixed-point values for a real model.
+  Weights and biases are sent by parameter-source processes. ConvLayer and
+  FCLayer instantiate their activation stages internally.
  ================================================================ */
 
 import "nn_layers.act";
@@ -22,61 +22,61 @@ import "nn_layers.act";
 ---------------------------------------------------------------- */
 
 defproc SimpleCNN (chan?(math::fixpoint<8,8>) pixel_in[1];
-                     chan!(math::fixpoint<8,8>) class_out[2])
+                   chan!(math::fixpoint<8,8>) class_out[2])
 {
   chan(math::fixpoint<8,8>) conv_out[2];
-  chan(math::fixpoint<8,8>) conv_act[2];
   chan(math::fixpoint<8,8>) pool_out[2];
   chan(math::fixpoint<8,8>) flat_out[8];
-  chan(math::fixpoint<8,8>) fc_raw[2];
 
-  // Parameterized convolution layer:
-  //   5x5 image, 2x2 kernel, 1 input channel, 2 output filters.
-  ConvLayer<5, 5, 2, 1, 2,
-            { 0.25,  0.25,
-              0.25,  0.25,
-              1.00, -1.00,
-              1.00, -1.00 },
-            { 0.0, 0.0 }> conv1 (pixel_in, conv_out);
+  chan(math::fixpoint<8,8>) conv_w[8];
+  chan(math::fixpoint<8,8>) conv_b[2];
+  chan(math::fixpoint<8,8>) fc_w[16];
+  chan(math::fixpoint<8,8>) fc_b[2];
 
-  Activation<2, 0.0> conv_relu[2];
-  conv_relu[0].in = conv_out[0];
-  conv_relu[0].out = conv_act[0];
-  conv_relu[1].in = conv_out[1];
-  conv_relu[1].out = conv_act[1];
+  // Runtime convolution parameters:
+  //   filter 0 averages a 2x2 patch.
+  //   filter 1 detects left/right contrast inside a 2x2 patch.
+  ConvLayerParamSource<2, 1, 2,
+                       { 0.25,  0.25,
+                         0.25,  0.25,
+                         1.00, -1.00,
+                         1.00, -1.00 },
+                       { 0.0, 0.0 }> conv_params (conv_w, conv_b);
+
+  ConvLayer<5, 5, 2, 1, 2, 2, 0.0> conv1 (
+    pixel_in, conv_w, conv_b, conv_out
+  );
 
   // Pool each 4x4 feature map down to 2x2.
-  MaxPool2x2<2, 4, 4> pool1 (conv_act, pool_out);
+  MaxPool<2, 4, 4, 2> pool1 (conv_out, pool_out);
 
   // Flatten 2 channels * 2 rows * 2 columns into 8 parallel values.
-  FlattenToParallel<2, 2, 2> flat1 (pool_out, flat_out);
+  Flatten<2, 2, 2> flat1 (pool_out, flat_out);
 
-  // Dense classifier:
-  //   class 0 fires mostly from pooled filter 0.
-  //   class 1 fires mostly from pooled filter 1.
-  FCLayer<8, 2,
-            { 1.0, 0.0, 1.0, 0.0,
-              1.0, 0.0, 1.0, 0.0,
-              0.0, 1.0, 0.0, 1.0,
-              0.0, 1.0, 0.0, 1.0 },
-            { -0.5, -4.5 }> fc1 (flat_out, fc_raw);
+  // Runtime dense classifier parameters:
+  //   class 0 mostly reads pooled filter 0.
+  //   class 1 mostly reads pooled filter 1.
+  FCLayerParamSource<8, 2,
+                     { 1.0, 0.0, 1.0, 0.0,
+                       1.0, 0.0, 1.0, 0.0,
+                       0.0, 1.0, 0.0, 1.0,
+                       0.0, 1.0, 0.0, 1.0 },
+                     { -0.5, -4.5 }> fc_params (fc_w, fc_b);
 
-  Activation<1, 0.0> class_act[2];
-  class_act[0].in = fc_raw[0];
-  class_act[0].out = class_out[0];
-  class_act[1].in = fc_raw[1];
-  class_act[1].out = class_out[1];
+  FCLayer<8, 2, 1, 0.0> fc1 (
+    flat_out, fc_w, fc_b, class_out
+  );
 }
 
 
 /* ---------------------------------------------------------------
-  SimpleCNN_Testbench
+  SimpleCNNTestbench
 
   Sends one 5x5 image and logs the two fixed-point class outputs as bools.
 ---------------------------------------------------------------- */
 
-defproc SimpleCNN_Testbench (chan!(math::fixpoint<8,8>) pixel_out[1];
-                               chan?(math::fixpoint<8,8>) class_out[2])
+defproc SimpleCNNTestbench (chan!(math::fixpoint<8,8>) pixel_out[1];
+                            chan?(math::fixpoint<8,8>) class_out[2])
 {
   math::fixpoint<8,8> v, half, c0, c1, diff;
   bool b0, b1;
@@ -130,15 +130,11 @@ defproc SimpleCNN_Testbench (chan!(math::fixpoint<8,8>) pixel_out[1];
 }
 
 
-/* ---------------------------------------------------------------
-  test
----------------------------------------------------------------- */
-
 defproc test ()
 {
   chan(math::fixpoint<8,8>) pixel[1];
   chan(math::fixpoint<8,8>) class_out[2];
 
   SimpleCNN cnn (pixel, class_out);
-  SimpleCNN_Testbench tb (pixel, class_out);
+  SimpleCNNTestbench tb (pixel, class_out);
 }

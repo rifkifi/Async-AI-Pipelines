@@ -2,8 +2,6 @@
   nn_layers.act
 
   Reusable fixed-point neural-network layers for asynchronous pipelines.
-  Includes both compile-time parameter layers and channel-loaded parameter
-  layers.
 
   Data type:
     All feature, pixel, weight, bias, and activation values use
@@ -24,111 +22,15 @@
       filter f, channel ch, kernel position k
         W[f*(N_IN_CH*K*K) + ch*K*K + k]
 
-  Runtime-parameter layer names:
-    FCLayerParam / FCLayerActParam
-    ConvLayerParam / ConvLayerActParam
  ================================================================ */
 
 import "math/fxp.act";
 
 
 /* ---------------------------------------------------------------
-  FCLayer<N_IN, N_OUT; W[], B[]>
-
-  Fully connected layer. Reads one activation from each of N_IN parallel input
-  channels, computes raw weighted sums, and emits one token per output channel.
----------------------------------------------------------------- */
-
-template<pint N_IN, N_OUT;
-         preal W[N_OUT*N_IN], B[N_OUT]>
-defproc FCLayer (chan?(math::fixpoint<8,8>) x_in[N_IN];
-                   chan!(math::fixpoint<8,8>) out[N_OUT])
-{
-  math::fixpoint<8,8> x[N_IN], wf[N_OUT*N_IN], bf[N_OUT];
-  math::fixpoint<8,8> acc[N_OUT];
-
-  chp {
-    (;j: N_OUT:
-      bf[j].set(bf[j].const(B[j]));
-      (;i: N_IN:
-        wf[j*N_IN + i].set(wf[j*N_IN + i].const(W[j*N_IN + i]))
-      )
-    );
-
-    *[
-      (;i: N_IN: x_in[i]?x[i]);
-      (,j: N_OUT:
-        acc[j] := bf[j];
-        (;i: N_IN:
-          acc[j] := acc[j] + wf[j*N_IN + i] * x[i]
-        );
-
-        out[j]!acc[j]
-      )
-    ]
-  }
-}
-
-
-/* ---------------------------------------------------------------
-  FCLayerAct<N_IN, N_OUT, ACT_FN; W[], B[], LEAK>
-
-  Fully connected layer with inline activation. No internal activation channel
-  is created.
----------------------------------------------------------------- */
-
-template<pint N_IN, N_OUT, ACT_FN;
-         preal W[N_OUT*N_IN], B[N_OUT], LEAK>
-defproc FCLayerAct (chan?(math::fixpoint<8,8>) x_in[N_IN];
-                    chan!(math::fixpoint<8,8>) out[N_OUT])
-{
-  math::fixpoint<8,8> x[N_IN], wf[N_OUT*N_IN], bf[N_OUT];
-  math::fixpoint<8,8> acc[N_OUT], z, one, leak, y[N_OUT];
-
-  chp {
-    z.set(z.const(0.0));
-    one.set(one.const(1.0));
-    leak.set(leak.const(LEAK));
-
-    (;j: N_OUT:
-      bf[j].set(bf[j].const(B[j]));
-      (;i: N_IN:
-        wf[j*N_IN + i].set(wf[j*N_IN + i].const(W[j*N_IN + i]))
-      )
-    );
-
-    *[
-      (;i: N_IN: x_in[i]?x[i]);
-
-      (,j: N_OUT:
-        acc[j] := bf[j];
-        (;i: N_IN:
-          acc[j] := acc[j] + wf[j*N_IN + i] * x[i]
-        );
-
-        [ ACT_FN = 0 ->
-            out[j]!acc[j]
-        [] ACT_FN = 1 ->
-            [ ~acc[j].negative() -> out[j]!one
-            [] else -> out[j]!z
-            ]
-        [] ACT_FN = 2 ->
-            [ ~acc[j].negative() -> out[j]!acc[j]
-            [] else -> out[j]!z
-            ]
-        [] ACT_FN = 3 ->
-            [ ~acc[j].negative() -> out[j]!acc[j]
-            [] else -> y[j] := leak * acc[j]; out[j]!y[j]
-            ]
-        ]
-      )
-    ]
-  }
-}
-
-
-/* ---------------------------------------------------------------
   Activation<ACT_FN, LEAK>
+
+  Generic activation function
 ---------------------------------------------------------------- */
 
 template<pint ACT_FN; preal LEAK>
@@ -163,10 +65,14 @@ defproc Activation (chan?(math::fixpoint<8,8>) in;
   }
 }
 
+
 /* ---------------------------------------------------------------
   WindowAssembler<IMG_W, IMG_H, K>
 
-  Converts one row-major image stream into valid K*K windows.
+  Converts one row-major IMG_W x IMG_H image stream into valid K*K
+  sliding windows with zero padding and stride 1. Uses a K-row
+  circular buffer so windows can be emitted as soon as enough rows
+  and columns have arrived.
 ---------------------------------------------------------------- */
 
 template<pint IMG_W, IMG_H, K>
@@ -210,7 +116,8 @@ defproc WindowAssembler (chan?(math::fixpoint<8,8>) pix_in;
 /* ---------------------------------------------------------------
   WinFork<N_OUT, K>
 
-  Broadcasts one K*K window to N_OUT filters.
+  Broadcasts each incoming K*K window to N_OUT filter input streams.
+  Each output filter receives an identical copy of the full window.
 ---------------------------------------------------------------- */
 
 template<pint N_OUT, K>
@@ -231,223 +138,10 @@ defproc WinFork (chan?(math::fixpoint<8,8>) win_in[K*K];
 
 
 /* ---------------------------------------------------------------
-  ConvBank<K, N_IN_CH, N_OUT; W[], B[]>
-
-  Generic homogeneous convolution bank. Receives all filter windows, then
-  computes output filters in parallel CHP branches.
----------------------------------------------------------------- */
-
-template<pint K, N_IN_CH, N_OUT;
-         preal W[N_OUT*N_IN_CH*K*K], B[N_OUT]>
-defproc ConvBank (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K];
-                  chan!(math::fixpoint<8,8>) out[N_OUT])
-{
-  math::fixpoint<8,8> vx[N_OUT][N_IN_CH][K*K];
-  math::fixpoint<8,8> wf[N_OUT*N_IN_CH*K*K], bf[N_OUT];
-  math::fixpoint<8,8> acc[N_OUT];
-
-  chp {
-    (;f: N_OUT:
-      bf[f].set(bf[f].const(B[f]));
-      (;ch: N_IN_CH:
-        (;k: K*K:
-          wf[f*(N_IN_CH*K*K) + ch*K*K + k].set(
-            wf[f*(N_IN_CH*K*K) + ch*K*K + k].const(
-              W[f*(N_IN_CH*K*K) + ch*K*K + k]
-            )
-          )
-        )
-      )
-    );
-
-    *[
-      (;f: N_OUT:
-        (;ch: N_IN_CH:
-          (;k: K*K:
-            win[f][ch][k]?vx[f][ch][k]
-          )
-        )
-      );
-
-      (,f: N_OUT:
-        acc[f] := bf[f];
-        (;ch: N_IN_CH:
-          (;k: K*K:
-            acc[f] := acc[f] + wf[f*(N_IN_CH*K*K) + ch*K*K + k]
-                              * vx[f][ch][k]
-          )
-        );
-        out[f]!acc[f]
-      )
-    ]
-  }
-}
-
-
-/* ---------------------------------------------------------------
-  ConvBankAct<K, N_IN_CH, N_OUT, ACT_FN; W[], B[], LEAK>
-
-  Generic homogeneous convolution bank with inline activation.
----------------------------------------------------------------- */
-
-template<pint K, N_IN_CH, N_OUT, ACT_FN;
-         preal W[N_OUT*N_IN_CH*K*K], B[N_OUT], LEAK>
-defproc ConvBankAct (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K];
-                     chan!(math::fixpoint<8,8>) out[N_OUT])
-{
-  math::fixpoint<8,8> vx[N_OUT][N_IN_CH][K*K];
-  math::fixpoint<8,8> wf[N_OUT*N_IN_CH*K*K], bf[N_OUT];
-  math::fixpoint<8,8> acc[N_OUT], z, one, leak, y[N_OUT];
-
-  chp {
-    z.set(z.const(0.0));
-    one.set(one.const(1.0));
-    leak.set(leak.const(LEAK));
-
-    (;f: N_OUT:
-      bf[f].set(bf[f].const(B[f]));
-      (;ch: N_IN_CH:
-        (;k: K*K:
-          wf[f*(N_IN_CH*K*K) + ch*K*K + k].set(
-            wf[f*(N_IN_CH*K*K) + ch*K*K + k].const(
-              W[f*(N_IN_CH*K*K) + ch*K*K + k]
-            )
-          )
-        )
-      )
-    );
-
-    *[
-      (;f: N_OUT:
-        (;ch: N_IN_CH:
-          (;k: K*K:
-            win[f][ch][k]?vx[f][ch][k]
-          )
-        )
-      );
-
-      (,f: N_OUT:
-        acc[f] := bf[f];
-        (;ch: N_IN_CH:
-          (;k: K*K:
-            acc[f] := acc[f] + wf[f*(N_IN_CH*K*K) + ch*K*K + k]
-                              * vx[f][ch][k]
-          )
-        );
-
-        [ ACT_FN = 0 ->
-            out[f]!acc[f]
-        [] ACT_FN = 1 ->
-            [ ~acc[f].negative() -> out[f]!one
-            [] else -> out[f]!z
-            ]
-        [] ACT_FN = 2 ->
-            [ ~acc[f].negative() -> out[f]!acc[f]
-            [] else -> out[f]!z
-            ]
-        [] ACT_FN = 3 ->
-            [ ~acc[f].negative() -> out[f]!acc[f]
-            [] else -> y[f] := leak * acc[f]; out[f]!y[f]
-            ]
-        ]
-      )
-    ]
-  }
-}
-
-
-/* ---------------------------------------------------------------
-  ConvLayer<IMG_W, IMG_H, K, N_IN_CH, N_OUT; W[], B[]>
-
-  Valid convolution, stride 1. Each output channel emits raw weighted sums in
-  row-major order.
----------------------------------------------------------------- */
-
-template<pint IMG_W, IMG_H, K, N_IN_CH, N_OUT;
-         preal W[N_OUT*N_IN_CH*K*K], B[N_OUT]>
-defproc ConvLayer (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH];
-                   chan!(math::fixpoint<8,8>) feat_out[N_OUT])
-{
-  chan(math::fixpoint<8,8>) raw_win[N_IN_CH][K*K];
-  chan(math::fixpoint<8,8>) forked[N_IN_CH][N_OUT][K*K];
-  chan(math::fixpoint<8,8>) conv_in[N_OUT][N_IN_CH][K*K];
-
-  WindowAssembler<IMG_W, IMG_H, K> wa[N_IN_CH];
-  (ch: N_IN_CH:
-    wa[ch].pix_in = pixel_in[ch];
-    wa[ch].win[0..K*K-1] = raw_win[ch][0..K*K-1];
-  )
-
-  WinFork<N_OUT, K> wf[N_IN_CH];
-  (ch: N_IN_CH:
-    wf[ch].win_in[0..K*K-1] = raw_win[ch][0..K*K-1];
-    wf[ch].win_out[0..N_OUT-1][0..K*K-1] =
-      forked[ch][0..N_OUT-1][0..K*K-1];
-  )
-
-  (f: N_OUT:
-    (ch: N_IN_CH:
-      (k: K*K:
-        conv_in[f][ch][k] = forked[ch][f][k];
-      )
-    )
-  )
-
-  ConvBank<K, N_IN_CH, N_OUT, W, B> conv_bank;
-  conv_bank.win[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1] =
-    conv_in[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1];
-  conv_bank.out[0..N_OUT-1] = feat_out[0..N_OUT-1];
-}
-
-
-/* ---------------------------------------------------------------
-  ConvLayerAct<IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN; W[], B[], LEAK>
-
-  Convolution layer with inline activation in ConvBankAct. No internal
-  activation channel is created.
----------------------------------------------------------------- */
-
-template<pint IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN;
-         preal W[N_OUT*N_IN_CH*K*K], B[N_OUT], LEAK>
-defproc ConvLayerAct (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH];
-                      chan!(math::fixpoint<8,8>) feat_out[N_OUT])
-{
-  chan(math::fixpoint<8,8>) raw_win[N_IN_CH][K*K];
-  chan(math::fixpoint<8,8>) forked[N_IN_CH][N_OUT][K*K];
-  chan(math::fixpoint<8,8>) conv_in[N_OUT][N_IN_CH][K*K];
-
-  WindowAssembler<IMG_W, IMG_H, K> wa[N_IN_CH];
-  (ch: N_IN_CH:
-    wa[ch].pix_in = pixel_in[ch];
-    wa[ch].win[0..K*K-1] = raw_win[ch][0..K*K-1];
-  )
-
-  WinFork<N_OUT, K> wf[N_IN_CH];
-  (ch: N_IN_CH:
-    wf[ch].win_in[0..K*K-1] = raw_win[ch][0..K*K-1];
-    wf[ch].win_out[0..N_OUT-1][0..K*K-1] =
-      forked[ch][0..N_OUT-1][0..K*K-1];
-  )
-
-  (f: N_OUT:
-    (ch: N_IN_CH:
-      (k: K*K:
-        conv_in[f][ch][k] = forked[ch][f][k];
-      )
-    )
-  )
-
-  ConvBankAct<K, N_IN_CH, N_OUT, ACT_FN, W, B, LEAK> conv_bank;
-  conv_bank.win[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1] =
-    conv_in[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1];
-  conv_bank.out[0..N_OUT-1] = feat_out[0..N_OUT-1];
-}
-
-
-/* ---------------------------------------------------------------
   MaxPoolCh<P, FEAT_W, FEAT_H>
 
-  P x P max-pooling with stride P for one feature-map stream.
+  Performs P x P max-pooling on one row-major FEAT_W x FEAT_H feature-map stream.
+  Emits one pooled value per non-overlapping P x P region.
 ---------------------------------------------------------------- */
 
 template<pint P, FEAT_W, FEAT_H>
@@ -489,6 +183,10 @@ defproc MaxPoolCh (chan?(math::fixpoint<8,8>) in;
 
 /* ---------------------------------------------------------------
   MaxPool<N_CH, FEAT_W, FEAT_H, P>
+
+  Applies MaxPoolCh<P, FEAT_W, FEAT_H> independently to each of the
+  N_CH feature-map streams. Each channel is pooled separately with
+  P x P windows.
 ---------------------------------------------------------------- */
 
 template<pint N_CH, FEAT_W, FEAT_H, P>
@@ -505,70 +203,13 @@ defproc MaxPool (chan?(math::fixpoint<8,8>) feat_in[N_CH];
 
 
 /* ---------------------------------------------------------------
-  MaxPool2x2Ch<FEAT_W, FEAT_H>
-
-  2x2 max-pooling with stride 2 for one feature-map stream.
----------------------------------------------------------------- */
-
-template<pint FEAT_W, FEAT_H>
-defproc MaxPool2x2Ch (chan?(math::fixpoint<8,8>) in;
-                        chan!(math::fixpoint<8,8>) out)
-{
-  MaxPoolCh<2, FEAT_W, FEAT_H> pool (.in = in, .out = out);
-}
-
-
-/* ---------------------------------------------------------------
-  MaxPool2x2<N_CH, FEAT_W, FEAT_H>
----------------------------------------------------------------- */
-
-template<pint N_CH, FEAT_W, FEAT_H>
-defproc MaxPool2x2 (chan?(math::fixpoint<8,8>) feat_in[N_CH];
-                      chan!(math::fixpoint<8,8>) pool_out[N_CH])
-{
-  MaxPool<N_CH, FEAT_W, FEAT_H, 2> pool (.feat_in = feat_in,
-                                          .pool_out = pool_out);
-}
-
-
-/* ---------------------------------------------------------------
   Flatten<N_CH, FEAT_H, FEAT_W>
 
-  Serializes N_CH feature-map streams into one flat stream.
+  Flattens N_CH feature-map streams into N_CH*FEAT_H*FEAT_W output channels.
 ---------------------------------------------------------------- */
 
 template<pint N_CH, FEAT_H, FEAT_W>
 defproc Flatten (chan?(math::fixpoint<8,8>) feat_in[N_CH];
-                   chan!(math::fixpoint<8,8>) flat_out)
-{
-  math::fixpoint<8,8> v;
-
-  chp {
-    *[
-      (;ch: N_CH:
-        (;r: FEAT_H:
-          (;c: FEAT_W:
-            feat_in[ch]?v;
-            flat_out!v
-          )
-        )
-      )
-    ]
-  }
-}
-
-
-/* ---------------------------------------------------------------
-  FlattenToParallel<N_CH, FEAT_H, FEAT_W>
-
-  Flattens N_CH feature-map streams into N_CH*FEAT_H*FEAT_W output channels.
-  Reads and emits by row, column, then channel to avoid blocking one channel
-  while draining another:
-    flat_out[(r*FEAT_W + c)*N_CH + ch].
----------------------------------------------------------------- */
-
-template<pint N_CH, FEAT_H, FEAT_W>
-defproc FlattenToParallel (chan?(math::fixpoint<8,8>) feat_in[N_CH];
                              chan!(math::fixpoint<8,8>) flat_out[N_CH*FEAT_H*FEAT_W])
 {
   math::fixpoint<8,8> v;
@@ -588,28 +229,16 @@ defproc FlattenToParallel (chan?(math::fixpoint<8,8>) feat_in[N_CH];
 }
 
 
-/* ================================================================
-  Runtime-parameter layer templates
-
-  These variants receive weights and biases through channels from another
-  process, store them once, and reuse them for all following input tensors.
-
-  Parameter sources below are convenience processes for tests and examples.
-  A real system can replace them with a memory or controller process that sends
-  values using the same channel order.
- ================================================================ */
-
-
 /* ---------------------------------------------------------------
   FCLayerParamSource<N_IN, N_OUT; W[], B[]>
 
-  Sends one FC parameter set to another process.
+  Sends one dense-layer parameter set to another process.
 ---------------------------------------------------------------- */
 
 template<pint N_IN, N_OUT;
          preal W[N_OUT*N_IN], B[N_OUT]>
 defproc FCLayerParamSource (chan!(math::fixpoint<8,8>) w_out[N_OUT*N_IN],
-                                                          b_out[N_OUT])
+                                                     b_out[N_OUT])
 {
   math::fixpoint<8,8> wf[N_OUT*N_IN], bf[N_OUT];
 
@@ -632,20 +261,29 @@ defproc FCLayerParamSource (chan!(math::fixpoint<8,8>) w_out[N_OUT*N_IN],
 
 
 /* ---------------------------------------------------------------
-  FCLayerParam<N_IN, N_OUT>
+  FCLayer<N_IN, N_OUT, ACT_FN; LEAK>
 
-  Receives W and B once from parameter channels, then computes raw dense-layer
-  outputs for every input vector.
+  Fully connected layer with channel-loaded weights and biases.
+  Weights and biases are received once, then reused for each input
+  vector. Each output has its own Activation<ACT_FN, LEAK> stage.
 ---------------------------------------------------------------- */
 
-template<pint N_IN, N_OUT>
-defproc FCLayerParam (chan?(math::fixpoint<8,8>) x_in[N_IN],
-                                                    w_in[N_OUT*N_IN],
-                                                    b_in[N_OUT];
-                      chan!(math::fixpoint<8,8>) out[N_OUT])
+template<pint N_IN, N_OUT, ACT_FN; preal LEAK>
+defproc FCLayer (chan?(math::fixpoint<8,8>) x_in[N_IN],
+                                              w_in[N_OUT*N_IN],
+                                              b_in[N_OUT];
+                 chan!(math::fixpoint<8,8>) out[N_OUT])
 {
   math::fixpoint<8,8> x[N_IN], wf[N_OUT*N_IN], bf[N_OUT];
   math::fixpoint<8,8> acc[N_OUT];
+  chan(math::fixpoint<8,8>) raw[N_OUT];
+
+  Activation<ACT_FN, LEAK> act[N_OUT];
+
+  (j: N_OUT:
+    act[j].in = raw[j];
+    act[j].out = out[j];
+  )
 
   chp {
     (;j: N_OUT:
@@ -663,32 +301,10 @@ defproc FCLayerParam (chan?(math::fixpoint<8,8>) x_in[N_IN],
         (;i: N_IN:
           acc[j] := acc[j] + wf[j*N_IN + i] * x[i]
         );
-        out[j]!acc[j]
+        raw[j]!acc[j]
       )
     ]
   }
-}
-
-
-/* ---------------------------------------------------------------
-  FCLayerActParam<N_IN, N_OUT, ACT_FN; LEAK>
----------------------------------------------------------------- */
-
-template<pint N_IN, N_OUT, ACT_FN; preal LEAK>
-defproc FCLayerActParam (chan?(math::fixpoint<8,8>) x_in[N_IN],
-                                                       w_in[N_OUT*N_IN],
-                                                       b_in[N_OUT];
-                         chan!(math::fixpoint<8,8>) out[N_OUT])
-{
-  chan(math::fixpoint<8,8>) raw[N_OUT];
-
-  FCLayerParam<N_IN, N_OUT> fc (x_in, w_in, b_in, raw);
-  Activation<ACT_FN, LEAK> act[N_OUT];
-
-  (j: N_OUT:
-    act[j].in = raw[j];
-    act[j].out = out[j];
-  )
 }
 
 
@@ -701,7 +317,7 @@ defproc FCLayerActParam (chan?(math::fixpoint<8,8>) x_in[N_IN],
 template<pint K, N_IN_CH, N_OUT;
          preal W[N_OUT*N_IN_CH*K*K], B[N_OUT]>
 defproc ConvLayerParamSource (chan!(math::fixpoint<8,8>) w_out[N_OUT*N_IN_CH*K*K],
-                                                            b_out[N_OUT])
+                                                       b_out[N_OUT])
 {
   math::fixpoint<8,8> wf[N_OUT*N_IN_CH*K*K], bf[N_OUT];
 
@@ -733,14 +349,21 @@ defproc ConvLayerParamSource (chan!(math::fixpoint<8,8>) w_out[N_OUT*N_IN_CH*K*K
 
 
 /* ---------------------------------------------------------------
-  ConvBankParam<K, N_IN_CH, N_OUT>
+  ConvBank<K, N_IN_CH, N_OUT>
+
+  Parallel convolution compute bank with channel-loaded weights and
+  biases. Weights and biases are received once, then reused for every
+  incoming window set. There are N_OUT filters, where each filter is
+  one set of N_IN_CH*K*K weights that produces one output channel.
+  The filters are computed in parallel and produce raw convolution
+  outputs.
 ---------------------------------------------------------------- */
 
 template<pint K, N_IN_CH, N_OUT>
-defproc ConvBankParam (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K],
-                                                     w_in[N_OUT*N_IN_CH*K*K],
-                                                     b_in[N_OUT];
-                       chan!(math::fixpoint<8,8>) out[N_OUT])
+defproc ConvBank (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K],
+                                                w_in[N_OUT*N_IN_CH*K*K],
+                                                b_in[N_OUT];
+                  chan!(math::fixpoint<8,8>) out[N_OUT])
 {
   math::fixpoint<8,8> vx[N_OUT][N_IN_CH][K*K];
   math::fixpoint<8,8> wf[N_OUT*N_IN_CH*K*K], bf[N_OUT];
@@ -782,18 +405,23 @@ defproc ConvBankParam (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K],
 
 
 /* ---------------------------------------------------------------
-  ConvLayerParam<IMG_W, IMG_H, K, N_IN_CH, N_OUT>
+  ConvLayer<IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN; LEAK>
+
+  Convolution layer with channel-loaded weights and biases.
+  WindowAssembler, WinFork, ConvBank, and
+  Activation are all instantiated directly inside this layer.
 ---------------------------------------------------------------- */
 
-template<pint IMG_W, IMG_H, K, N_IN_CH, N_OUT>
-defproc ConvLayerParam (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH],
-                                                      w_in[N_OUT*N_IN_CH*K*K],
-                                                      b_in[N_OUT];
-                        chan!(math::fixpoint<8,8>) feat_out[N_OUT])
+template<pint IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN; preal LEAK>
+defproc ConvLayer (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH],
+                                                w_in[N_OUT*N_IN_CH*K*K],
+                                                b_in[N_OUT];
+                   chan!(math::fixpoint<8,8>) feat_out[N_OUT])
 {
   chan(math::fixpoint<8,8>) raw_win[N_IN_CH][K*K];
   chan(math::fixpoint<8,8>) forked[N_IN_CH][N_OUT][K*K];
   chan(math::fixpoint<8,8>) conv_in[N_OUT][N_IN_CH][K*K];
+  chan(math::fixpoint<8,8>) raw[N_OUT];
 
   WindowAssembler<IMG_W, IMG_H, K> wa[N_IN_CH];
   (ch: N_IN_CH:
@@ -816,33 +444,15 @@ defproc ConvLayerParam (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH],
     )
   )
 
-  ConvBankParam<K, N_IN_CH, N_OUT> conv_bank;
+  ConvBank<K, N_IN_CH, N_OUT> conv_bank;
   conv_bank.win[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1] =
     conv_in[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1];
   conv_bank.w_in[0..N_OUT*N_IN_CH*K*K-1] =
     w_in[0..N_OUT*N_IN_CH*K*K-1];
   conv_bank.b_in[0..N_OUT-1] = b_in[0..N_OUT-1];
-  conv_bank.out[0..N_OUT-1] = feat_out[0..N_OUT-1];
-}
+  conv_bank.out[0..N_OUT-1] = raw[0..N_OUT-1];
 
-
-/* ---------------------------------------------------------------
-  ConvLayerActParam<IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN; LEAK>
----------------------------------------------------------------- */
-
-template<pint IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN; preal LEAK>
-defproc ConvLayerActParam (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH],
-                                                         w_in[N_OUT*N_IN_CH*K*K],
-                                                         b_in[N_OUT];
-                           chan!(math::fixpoint<8,8>) feat_out[N_OUT])
-{
-  chan(math::fixpoint<8,8>) raw[N_OUT];
-
-  ConvLayerParam<IMG_W, IMG_H, K, N_IN_CH, N_OUT> conv (
-    pixel_in, w_in, b_in, raw
-  );
   Activation<ACT_FN, LEAK> act[N_OUT];
-
   (f: N_OUT:
     act[f].in = raw[f];
     act[f].out = feat_out[f];
