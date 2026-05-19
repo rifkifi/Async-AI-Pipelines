@@ -440,11 +440,4 @@ MaxPool
 E2E mini-CNN
 ```
 
-## Possible Work
 
-- Add tests for larger multi-channel convolution cases.
-- Evaluate throughput, latency, handshake overhead, and pipeline bottlenecks.
-- Build a full CNN or FC model in software and ACT, then compare results.
-- Generate PRS or lower-level hardware implementations.
-- Add more activation functions such as softmax or tanh.
-- Explore different pipeline boundaries between layer stages.
