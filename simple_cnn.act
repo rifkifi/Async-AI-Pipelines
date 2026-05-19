@@ -127,7 +127,7 @@ defproc SimpleCNNTestbench (chan!(math::fixpoint<8,8>) pixel_out[1];
       diff := c1 - half;
       [ ~diff.negative() -> b1 := true [] else -> b1 := false ];
   
-      log("RUN:", run, "| OUT:", b0, b1);
+      log("RUN:", run, "| OUT1: ", b0, ", OUT2: ", b1);
       run := run + 1
     ];
     log("TEST_DONE: runs=", run)

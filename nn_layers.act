@@ -215,7 +215,7 @@ template<pint N_CH, FEAT_W, FEAT_H, P, PERF_MODE=0>
 defproc MaxPool (chan?(math::fixpoint<8,8>) feat_in[N_CH];
                    chan!(math::fixpoint<8,8>) pool_out[N_CH])
 {
-  MaxPoolCh<2,FEAT_W, FEAT_H, PERF_MODE> pool_ch[N_CH];
+  MaxPoolCh<P, FEAT_W, FEAT_H, PERF_MODE> pool_ch[N_CH];
 
   (ch: N_CH:
     pool_ch[ch].in = feat_in[ch];

@@ -1,5 +1,12 @@
 # Async AI Pipelines
 
+## Group 11:
+
+* Rifki Firdaus - s250169
+* Aaditya Gupta - s257326
+* Kunal Gurudath Athikary - s252718
+* Arjun Babu Anand - s252759
+
 This project contains ACT templates and examples for fixed-point asynchronous
 neural-network pipelines.
 
@@ -22,19 +29,19 @@ import "nn_layers.act";
 
 `nn_layers.act` currently defines these templates:
 
-| Template | Role |
-| --- | --- |
-| `Activation` | Standalone activation process |
-| `WindowAssembler` | Converts one image stream into valid convolution windows |
-| `WinFork` | Broadcasts one window to multiple convolution filters |
-| `MaxPoolCh` | Parameterized `P x P` max-pooling for one channel |
-| `MaxPool` | Multi-channel wrapper around `MaxPoolCh` |
-| `Flatten` | Flattens feature-map streams into parallel vector channels |
-| `FCLayerParamSource` | Sends one dense-layer weight/bias set |
-| `FCLayer` | Channel-loaded fully connected layer with internal activation |
-| `ConvLayerParamSource` | Sends one convolution weight/bias set |
-| `ConvBank` | Channel-loaded convolution compute bank without activation |
-| `ConvLayer` | Channel-loaded convolution layer with internal activation |
+| Template                 | Role                                                          |
+| ------------------------ | ------------------------------------------------------------- |
+| `Activation`           | Standalone activation process                                 |
+| `WindowAssembler`      | Converts one image stream into valid convolution windows      |
+| `WinFork`              | Broadcasts one window to multiple convolution filters         |
+| `MaxPoolCh`            | Parameterized `P x P` max-pooling for one channel           |
+| `MaxPool`              | Multi-channel wrapper around `MaxPoolCh`                    |
+| `Flatten`              | Flattens feature-map streams into parallel vector channels    |
+| `FCLayerParamSource`   | Sends one dense-layer weight/bias set                         |
+| `FCLayer`              | Channel-loaded fully connected layer with internal activation |
+| `ConvLayerParamSource` | Sends one convolution weight/bias set                         |
+| `ConvBank`             | Channel-loaded convolution compute bank without activation    |
+| `ConvLayer`            | Channel-loaded convolution layer with internal activation     |
 
 Dense and convolution layers receive weights and biases through channels once,
 store them locally, and reuse them for later input streams. `FCLayer` and
@@ -49,12 +56,12 @@ defproc Activation (chan?(math::fixpoint<8,8>) in;
                     chan!(math::fixpoint<8,8>) out)
 ```
 
-| `ACT_FN` | Name | Output |
-| --- | --- | --- |
-| `0` | Linear | `x` |
-| `1` | Step | `1.0` when `x >= 0`, else `0.0` |
-| `2` | ReLU | `x` when `x >= 0`, else `0.0` |
-| `3` | Leaky ReLU | `x` when `x >= 0`, else `LEAK * x` |
+| `ACT_FN` | Name       | Output                                   |
+| ---------- | ---------- | ---------------------------------------- |
+| `0`      | Linear     | `x`                                    |
+| `1`      | Step       | `1.0` when `x >= 0`, else `0.0`    |
+| `2`      | ReLU       | `x` when `x >= 0`, else `0.0`      |
+| `3`      | Leaky ReLU | `x` when `x >= 0`, else `LEAK * x` |
 
 The implementation uses `~x.negative()` as the non-negative test.
 
@@ -256,9 +263,114 @@ Flatten input:     Flatten<N_OUT, POOL_H, POOL_W>
 FCLayer input:     N_OUT * POOL_H * POOL_W
 ```
 
+## Testbenches
+
+`nn_layers_tb.act` contains focused functional tests for the reusable layer
+templates plus an end-to-end mini-CNN test.
+
+Current `Main` test labels:
+
+```text
+Activation/Linear
+Activation/Step
+Activation/ReLU
+Activation/LeakyReLU
+WindowAssembler
+WinFork
+ConvBank
+Flatten
+FCLayer
+ConvLayer
+MaxPoolCh
+MaxPool
+E2E mini-CNN
+```
+
+## XOR Neural Network
+
+`xor_ann.act` is a three-layer fully connected threshold network:
+
+![XOR Architecture](pictures/xor.png "XOR Architecture")
+
+```text
+x1, x2
+  -> input_layer   FCLayer<2,2,step>
+  -> hidden_layer  FCLayer<2,2,step>
+  -> output_layer  FCLayer<2,1,step>
+  -> y
+```
+
+Pipeline diagram:
+
+```mermaid
+flowchart LR
+    x1["x1_in"]
+    x2["x2_in"]
+    inp["input_layer<br/>FCLayer<2,2,1,0.0><br/>b1,b2"]
+    hid["hidden_layer<br/>FCLayer<2,2,1,0.0><br/>a1,a2"]
+    outlayer["output_layer<br/>FCLayer<2,1,1,0.0><br/>y"]
+    y["y_out"]
+
+    p0["FCLayerParamSource<br/>input weights"]
+    p1["FCLayerParamSource<br/>hidden weights"]
+    p2["FCLayerParamSource<br/>output weights"]
+
+    x1 --> inp
+    x2 --> inp
+    p0 -. weights and biases .-> inp
+    inp --> hid
+    p1 -. weights and biases .-> hid
+    hid --> outlayer
+    p2 -. weights and biases .-> outlayer
+    outlayer --> y
+```
+
+Expected truth table:
+
+| `x1` | `x2` | `y` |
+| ------ | ------ | ----- |
+| `0`  | `0`  | `0` |
+| `0`  | `1`  | `1` |
+| `1`  | `0`  | `1` |
+| `1`  | `1`  | `0` |
+
+Layer 1 thresholds the raw inputs:
+
+```text
+b1 = step(x1 - 0.5)
+b2 = step(x2 - 0.5)
+```
+
+Layer 2 builds hidden features:
+
+```text
+a1 = step( b1 + b2 - 1)
+a2 = step(-b1 - b2 + 1)
+```
+
+Layer 3 computes XOR:
+
+```text
+y = step(a1 + a2 - 2)
+```
+
+Each `FCLayer` receives its weights and biases once from a matching
+`FCLayerParamSource`, then reuses those parameters for all four input cases in
+the testbench.
+
+The observed simulation output was:
+
+```text
+xor(0,0) = 0
+xor(0,1) = 1
+xor(1,0) = 1
+xor(1,1) = 0
+```
+
 ## Simple CNN
 
 `simple_cnn.act` is a small CNN-style pipeline:
+![CNN Architecture](pictures/cnn.png "CNN Architecture")
 
 ```text
 Input:    5x5 image, 1 channel
@@ -338,106 +450,33 @@ fixed-point values.
 It receives `class_out[0]` and `class_out[1]`, compares each to `0.5`, and
 logs boolean class results.
 
-## XOR Neural Network
+## Run
 
-`xor_ann.act` is a three-layer fully connected threshold network:
+### Requirements
 
-```text
-x1, x2
-  -> input_layer   FCLayer<2,2,step>
-  -> hidden_layer  FCLayer<2,2,step>
-  -> output_layer  FCLayer<2,1,step>
-  -> y
+* ACT Tools installed
+* add tools bin to systems PATH
+
+### Run Testbench
+
+```
+$ actsim -Wlang_subst:off nn_layers_tb.act Main
+$ cycle
+$ exit 
 ```
 
-Pipeline diagram:
+### Run XOR
 
-```mermaid
-flowchart LR
-    x1["x1_in"]
-    x2["x2_in"]
-    inp["input_layer<br/>FCLayer<2,2,1,0.0><br/>b1,b2"]
-    hid["hidden_layer<br/>FCLayer<2,2,1,0.0><br/>a1,a2"]
-    outlayer["output_layer<br/>FCLayer<2,1,1,0.0><br/>y"]
-    y["y_out"]
-
-    p0["FCLayerParamSource<br/>input weights"]
-    p1["FCLayerParamSource<br/>hidden weights"]
-    p2["FCLayerParamSource<br/>output weights"]
-
-    x1 --> inp
-    x2 --> inp
-    p0 -. weights and biases .-> inp
-    inp --> hid
-    p1 -. weights and biases .-> hid
-    hid --> outlayer
-    p2 -. weights and biases .-> outlayer
-    outlayer --> y
+```
+$ actsim -Wlang_subst:off xor_ann.act test
+$ cycle
+$ exit 
 ```
 
-Expected truth table:
+### Run CNN
 
-| `x1` | `x2` | `y` |
-| --- | --- | --- |
-| `0` | `0` | `0` |
-| `0` | `1` | `1` |
-| `1` | `0` | `1` |
-| `1` | `1` | `0` |
-
-Layer 1 thresholds the raw inputs:
-
-```text
-b1 = step(x1 - 0.5)
-b2 = step(x2 - 0.5)
 ```
-
-Layer 2 builds hidden features:
-
-```text
-a1 = step( b1 + b2 - 1)
-a2 = step(-b1 - b2 + 1)
+$ actsim -Wlang_subst:off simple_cnn.act test
+$ cycle
+$ exit 
 ```
-
-Layer 3 computes XOR:
-
-```text
-y = step(a1 + a2 - 2)
-```
-
-Each `FCLayer` receives its weights and biases once from a matching
-`FCLayerParamSource`, then reuses those parameters for all four input cases in
-the testbench.
-
-The observed simulation output was:
-
-```text
-xor(0,0) = 0
-xor(0,1) = 1
-xor(1,0) = 1
-xor(1,1) = 0
-```
-
-## Testbenches
-
-`nn_layers_tb.act` contains focused functional tests for the reusable layer
-templates plus an end-to-end mini-CNN test.
-
-Current `Main` test labels:
-
-```text
-Activation/Linear
-Activation/Step
-Activation/ReLU
-Activation/LeakyReLU
-WindowAssembler
-WinFork
-ConvBank
-Flatten
-FCLayer
-ConvLayer
-MaxPoolCh
-MaxPool
-E2E mini-CNN
-```
-
-

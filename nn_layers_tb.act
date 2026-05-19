@@ -314,7 +314,7 @@ defproc TB_Flatten (chan!(bool) pass)
 {
   chan(math::fixpoint<8,8>) feat[2], flat[6];
   FlatSrc<0>               src (.feat_in  = feat);
-  Flatten<2, 1, 3>  dut (.feat_in  = feat, .flat_out = flat);
+  Flatten<2, 1, 3, 0>  dut (.feat_in  = feat, .flat_out = flat);
   FlatSink<0>              snk (.flat_out = flat,  .pass = pass);
 }
 
@@ -360,7 +360,7 @@ defproc TB_FCLayer (chan!(bool) pass)
                      {-1.0, -1.0},
                      {0.0}>              psrc (.w_out = w_ch, .b_out = b_ch);
   FCLayerSrc2<0>                            xsrc (.x    = x);
-  FCLayer<2, 1, 2, 0, 0.0>          dut  (.x_in = x, .w_in = w_ch,
+  FCLayer<2, 1, 2, 0, 0.0>       dut  (.x_in = x, .w_in = w_ch,
                                                .b_in = b_ch, .out = y);
   FCLayerSink<0>                            snk  (.out  = y, .pass = pass);
 }
@@ -542,7 +542,7 @@ defproc TB_MaxPool (chan!(bool) pass)
 {
   chan(math::fixpoint<8,8>) feat[2], pool[2];
   MaxPoolSrc2Ch<0>           src (.feat_in  = feat);
-  MaxPool<2, 6, 6, 3>        dut (.feat_in  = feat, .pool_out = pool);
+  MaxPool<2, 6, 6, 3, 0>     dut (.feat_in  = feat, .pool_out = pool);
   MaxPoolSink2Ch<0>          snk (.pool_out = pool, .pass = pass);
 }
 
@@ -588,19 +588,19 @@ defproc TB_E2E (chan!(bool) pass)
                        {1.0},
                        {-6.0}>                  conv_p (.w_out = conv_w,
                                                         .b_out = conv_b);
-  ConvLayer<4, 4, 1, 1, 1, 2, 0, 0.0>             conv   (.pixel_in = pix,
+  ConvLayer<4, 4, 1, 1, 1, 2, 0, 0.0>          conv   (.pixel_in = pix,
                                                         .w_in = conv_w,
                                                         .b_in = conv_b,
                                                         .feat_out = conv_out);
-  MaxPool<1, 4, 4, 2>                          pool   (.feat_in  = conv_out,
+  MaxPool<1, 4, 4, 2, 0>                       pool   (.feat_in  = conv_out,
                                                         .pool_out = pool_out);
-  Flatten<1, 2, 2>                             flat_p (.feat_in  = pool_out,
+  Flatten<1, 2, 2, 0>                          flat_p (.feat_in  = pool_out,
                                                         .flat_out = flat);
   FCLayerParamSource<4, 1,
                      {0.25, 0.25, 0.25, 0.25},
                      {-0.1}>                    fc_p   (.w_out = fc_w,
                                                         .b_out = fc_b);
-  FCLayer<4, 1, 1, 0, 0.0>                        fc     (.x_in = flat,
+  FCLayer<4, 1, 1, 0, 0.0>                     fc     (.x_in = flat,
                                                         .w_in = fc_w,
                                                         .b_in = fc_b,
                                                         .out = fc_out);
