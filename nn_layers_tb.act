@@ -360,7 +360,7 @@ defproc TB_FCLayer (chan!(bool) pass)
                      {-1.0, -1.0},
                      {0.0}>              psrc (.w_out = w_ch, .b_out = b_ch);
   FCLayerSrc2<0>                            xsrc (.x    = x);
-  FCLayer<2, 1, 2, 0.0>          dut  (.x_in = x, .w_in = w_ch,
+  FCLayer<2, 1, 2, 0, 0.0>          dut  (.x_in = x, .w_in = w_ch,
                                                .b_in = b_ch, .out = y);
   FCLayerSink<0>                            snk  (.out  = y, .pass = pass);
 }
@@ -408,7 +408,7 @@ defproc TB_ConvLayer (chan!(bool) pass)
                        {1.0},
                        {-100.0}>         psrc (.w_out = w_ch, .b_out = b_ch);
   ConvLayerSrc<0>                        xsrc (.pixel_in = pix);
-  ConvLayer<4, 4, 1, 1, 1, 2, 0.0>
+  ConvLayer<4, 4, 1, 1, 1, 2, 0, 0.0>
                                          dut  (.pixel_in = pix,
                                                .w_in = w_ch, .b_in = b_ch,
                                                .feat_out = feat);
@@ -588,7 +588,7 @@ defproc TB_E2E (chan!(bool) pass)
                        {1.0},
                        {-6.0}>                  conv_p (.w_out = conv_w,
                                                         .b_out = conv_b);
-  ConvLayer<4, 4, 1, 1, 1, 2, 0.0>             conv   (.pixel_in = pix,
+  ConvLayer<4, 4, 1, 1, 1, 2, 0, 0.0>             conv   (.pixel_in = pix,
                                                         .w_in = conv_w,
                                                         .b_in = conv_b,
                                                         .feat_out = conv_out);
@@ -600,7 +600,7 @@ defproc TB_E2E (chan!(bool) pass)
                      {0.25, 0.25, 0.25, 0.25},
                      {-0.1}>                    fc_p   (.w_out = fc_w,
                                                         .b_out = fc_b);
-  FCLayer<4, 1, 1, 0.0>                        fc     (.x_in = flat,
+  FCLayer<4, 1, 1, 0, 0.0>                        fc     (.x_in = flat,
                                                         .w_in = fc_w,
                                                         .b_in = fc_b,
                                                         .out = fc_out);

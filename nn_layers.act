@@ -82,42 +82,44 @@ defproc WindowAssembler (chan?(math::fixpoint<8,8>) pix_in;
   math::fixpoint<8,8> buf[K][IMG_W];
   int<16> row_idx, col_idx, rptr, start_col;
   int<32> wa_iter, wa_hs;
-  chp {
-    row_idx := 0;
-    col_idx := 0;
-    rptr := 0;
+    chp {
+    *[                                  
+      row_idx := 0;
+      col_idx := 0;
+      rptr := 0;
 
-    [ PERF_MODE=1 -> wa_iter:=0; wa_hs:=0; log("PERF_INIT:WindowAssembler") [] else -> skip ];
-    *[ row_idx < IMG_H ->
-      [ PERF_MODE=1 -> [ wa_iter % 5 = 0 -> log("PERF:WindowAssembler_RX_START:iter=", wa_iter) [] 
-      else -> skip ] [] else -> skip ];
-      *[ col_idx < IMG_W ->
-        pix_in?buf[rptr][col_idx];
+      [ PERF_MODE=1 -> wa_iter:=0; wa_hs:=0; log("PERF_INIT:WindowAssembler") [] else -> skip ];
+      *[ row_idx < IMG_H ->
+        [ PERF_MODE=1 -> [ wa_iter % 5 = 0 -> log("PERF:WindowAssembler_RX_START:iter=", wa_iter) [] 
+        else -> skip ] [] else -> skip ];
+        *[ col_idx < IMG_W ->
+          pix_in?buf[rptr][col_idx];
 
-        [ (row_idx >= (K-1)) & (col_idx >= (K-1)) ->
-            start_col := col_idx + 1 - K;
-            (,kr: K:
-              (,kc: K:
-                win[kr*K + kc]!buf[(rptr + kr + 1) % K][start_col + kc]
+          [ (row_idx >= (K-1)) & (col_idx >= (K-1)) ->
+              start_col := col_idx + 1 - K;
+              (,kr: K:
+                (,kc: K:
+                  win[kr*K + kc]!buf[(rptr + kr + 1) % K][start_col + kc]
+                )
               )
-            )
-        [] else ->
-            skip
+          [] else ->
+              skip
+          ];
+
+          col_idx := col_idx + 1
         ];
 
-        col_idx := col_idx + 1
-      ];
-
-      col_idx := 0;
-      rptr := (rptr + 1) % K;
-      row_idx := row_idx + 1;
-      [ PERF_MODE=1 -> [ wa_iter % 5 = 0 -> log("PERF:WindowAssembler_RX_END:iter=", wa_iter) [] 
-      else -> skip ] [] else -> skip ];
-      wa_hs := wa_hs + 1;
-      wa_iter := wa_iter + 1;
-      [ PERF_MODE=1 -> [ wa_iter % 5 = 0 -> log("PERF:WindowAssembler_DONE:iter=", wa_iter) [] 
-      else -> skip ] [] else -> skip ]
-    ]
+        col_idx := 0;
+        rptr := (rptr + 1) % K;
+        row_idx := row_idx + 1;
+        [ PERF_MODE=1 -> [ wa_iter % 5 = 0 -> log("PERF:WindowAssembler_RX_END:iter=", wa_iter) [] 
+        else -> skip ] [] else -> skip ];
+        wa_hs := wa_hs + 1;
+        wa_iter := wa_iter + 1;
+        [ PERF_MODE=1 -> [ wa_iter % 5 = 0 -> log("PERF:WindowAssembler_DONE:iter=", wa_iter) [] 
+        else -> skip ] [] else -> skip ]
+      ]
+    ]                                   
   }
 }
 
@@ -160,41 +162,43 @@ defproc MaxPoolCh (chan?(math::fixpoint<8,8>) in;
   math::fixpoint<8,8> buf[P][FEAT_W], m, diff;
   int<16> col, row;
   int<32> mp_iter, mp_hs;
-  chp {
-    row := 0;
-    [ PERF_MODE=1 -> mp_iter:=0; mp_hs:=0; log("PERF_INIT:MaxPoolCh") [] else -> skip ];
-    *[ row < FEAT_H ->
-      [ PERF_MODE=1 -> [ mp_iter % 5 = 0 -> log("PERF:MaxPoolCh_RX_START:iter=", mp_iter) [] 
-      else -> skip ] [] else -> skip ];
-      (;r: P:
-        (;c: FEAT_W:
-          in?buf[r][c]
-        )
-      );
-
-      [ PERF_MODE=1 -> [ mp_iter % 5 = 0 -> log("PERF:MaxPoolCh_RX_END:iter=", mp_iter) [] 
-      else -> skip ] [] else -> skip ];
-      col := 0;
-      *[ col < FEAT_W ->
-        m := buf[0][col];
-
-        (;pr: P:
-          (;pc: P:
-            diff := buf[pr][col+pc] - m;
-            [ ~diff.negative() -> m := buf[pr][col+pc] [] else -> skip ]
+    chp {
+    *[                                   
+      row := 0;
+      [ PERF_MODE=1 -> mp_iter:=0; mp_hs:=0; log("PERF_INIT:MaxPoolCh") [] else -> skip ];
+      *[ row < FEAT_H ->
+        [ PERF_MODE=1 -> [ mp_iter % 5 = 0 -> log("PERF:MaxPoolCh_RX_START:iter=", mp_iter) [] 
+        else -> skip ] [] else -> skip ];
+        (;r: P:
+          (;c: FEAT_W:
+            in?buf[r][c]
           )
         );
 
-        out!m;
-        col := col + P
-      ];
+        [ PERF_MODE=1 -> [ mp_iter % 5 = 0 -> log("PERF:MaxPoolCh_RX_END:iter=", mp_iter) [] 
+        else -> skip ] [] else -> skip ];
+        col := 0;
+        *[ col < FEAT_W ->
+          m := buf[0][col];
 
-      row := row + P;
-       mp_hs := mp_hs + 1;
-      mp_iter := mp_iter + 1;
-      [ PERF_MODE=1 -> [ mp_iter % 5 = 0 -> log("PERF:MaxPoolCh_DONE:iter=", mp_iter) [] 
-      else -> skip ] [] else -> skip ]
-    ]
+          (;pr: P:
+            (;pc: P:
+              diff := buf[pr][col+pc] - m;
+              [ ~diff.negative() -> m := buf[pr][col+pc] [] else -> skip ]
+            )
+          );
+
+          out!m;
+          col := col + P
+        ];
+
+        row := row + P;
+         mp_hs := mp_hs + 1;
+        mp_iter := mp_iter + 1;
+        [ PERF_MODE=1 -> [ mp_iter % 5 = 0 -> log("PERF:MaxPoolCh_DONE:iter=", mp_iter) [] 
+        else -> skip ] [] else -> skip ]
+      ]
+    ]                                    
   }
 }
 
