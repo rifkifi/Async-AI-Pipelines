@@ -75,19 +75,22 @@ defproc Activation (chan?(math::fixpoint<8,8>) in;
   and columns have arrived.
 ---------------------------------------------------------------- */
 
-template<pint IMG_W, IMG_H, K>
+template<pint IMG_W, IMG_H, K, PERF_MODE=0>
 defproc WindowAssembler (chan?(math::fixpoint<8,8>) pix_in;
                            chan!(math::fixpoint<8,8>) win[K*K])
 {
   math::fixpoint<8,8> buf[K][IMG_W];
   int<16> row_idx, col_idx, rptr, start_col;
-
+  int<32> wa_iter, wa_hs;
   chp {
     row_idx := 0;
     col_idx := 0;
     rptr := 0;
 
+    [ PERF_MODE=1 -> wa_iter:=0; wa_hs:=0; log("PERF_INIT:WindowAssembler") [] else -> skip ];
     *[ row_idx < IMG_H ->
+      [ PERF_MODE=1 -> [ wa_iter % 5 = 0 -> log("PERF:WindowAssembler_RX_START:iter=", wa_iter) [] 
+      else -> skip ] [] else -> skip ];
       *[ col_idx < IMG_W ->
         pix_in?buf[rptr][col_idx];
 
@@ -107,7 +110,13 @@ defproc WindowAssembler (chan?(math::fixpoint<8,8>) pix_in;
 
       col_idx := 0;
       rptr := (rptr + 1) % K;
-      row_idx := row_idx + 1
+      row_idx := row_idx + 1;
+      [ PERF_MODE=1 -> [ wa_iter % 5 = 0 -> log("PERF:WindowAssembler_RX_END:iter=", wa_iter) [] 
+      else -> skip ] [] else -> skip ];
+      wa_hs := wa_hs + 1;
+      wa_iter := wa_iter + 1;
+      [ PERF_MODE=1 -> [ wa_iter % 5 = 0 -> log("PERF:WindowAssembler_DONE:iter=", wa_iter) [] 
+      else -> skip ] [] else -> skip ]
     ]
   }
 }
@@ -144,22 +153,27 @@ defproc WinFork (chan?(math::fixpoint<8,8>) win_in[K*K];
   Emits one pooled value per non-overlapping P x P region.
 ---------------------------------------------------------------- */
 
-template<pint P, FEAT_W, FEAT_H>
+template<pint P, FEAT_W, FEAT_H, PERF_MODE=0>
 defproc MaxPoolCh (chan?(math::fixpoint<8,8>) in;
                      chan!(math::fixpoint<8,8>) out)
 {
   math::fixpoint<8,8> buf[P][FEAT_W], m, diff;
   int<16> col, row;
-
+  int<32> mp_iter, mp_hs;
   chp {
     row := 0;
+    [ PERF_MODE=1 -> mp_iter:=0; mp_hs:=0; log("PERF_INIT:MaxPoolCh") [] else -> skip ];
     *[ row < FEAT_H ->
+      [ PERF_MODE=1 -> [ mp_iter % 5 = 0 -> log("PERF:MaxPoolCh_RX_START:iter=", mp_iter) [] 
+      else -> skip ] [] else -> skip ];
       (;r: P:
         (;c: FEAT_W:
           in?buf[r][c]
         )
       );
 
+      [ PERF_MODE=1 -> [ mp_iter % 5 = 0 -> log("PERF:MaxPoolCh_RX_END:iter=", mp_iter) [] 
+      else -> skip ] [] else -> skip ];
       col := 0;
       *[ col < FEAT_W ->
         m := buf[0][col];
@@ -175,7 +189,11 @@ defproc MaxPoolCh (chan?(math::fixpoint<8,8>) in;
         col := col + P
       ];
 
-      row := row + P
+      row := row + P;
+       mp_hs := mp_hs + 1;
+      mp_iter := mp_iter + 1;
+      [ PERF_MODE=1 -> [ mp_iter % 5 = 0 -> log("PERF:MaxPoolCh_DONE:iter=", mp_iter) [] 
+      else -> skip ] [] else -> skip ]
     ]
   }
 }
@@ -189,11 +207,11 @@ defproc MaxPoolCh (chan?(math::fixpoint<8,8>) in;
   P x P windows.
 ---------------------------------------------------------------- */
 
-template<pint N_CH, FEAT_W, FEAT_H, P>
+template<pint N_CH, FEAT_W, FEAT_H, P, PERF_MODE=0>
 defproc MaxPool (chan?(math::fixpoint<8,8>) feat_in[N_CH];
                    chan!(math::fixpoint<8,8>) pool_out[N_CH])
 {
-  MaxPoolCh<P, FEAT_W, FEAT_H> pool_ch[N_CH];
+  MaxPoolCh<2,FEAT_W, FEAT_H, PERF_MODE> pool_ch[N_CH];
 
   (ch: N_CH:
     pool_ch[ch].in = feat_in[ch];
@@ -208,7 +226,7 @@ defproc MaxPool (chan?(math::fixpoint<8,8>) feat_in[N_CH];
   Flattens N_CH feature-map streams into N_CH*FEAT_H*FEAT_W output channels.
 ---------------------------------------------------------------- */
 
-template<pint N_CH, FEAT_H, FEAT_W>
+template<pint N_CH, FEAT_H, FEAT_W, PERF_MODE=0>
 defproc Flatten (chan?(math::fixpoint<8,8>) feat_in[N_CH];
                              chan!(math::fixpoint<8,8>) flat_out[N_CH*FEAT_H*FEAT_W])
 {
@@ -268,7 +286,7 @@ defproc FCLayerParamSource (chan!(math::fixpoint<8,8>) w_out[N_OUT*N_IN],
   vector. Each output has its own Activation<ACT_FN, LEAK> stage.
 ---------------------------------------------------------------- */
 
-template<pint N_IN, N_OUT, ACT_FN; preal LEAK>
+template<pint N_IN, N_OUT, ACT_FN, PERF_MODE=0; preal LEAK> 
 defproc FCLayer (chan?(math::fixpoint<8,8>) x_in[N_IN],
                                               w_in[N_OUT*N_IN],
                                               b_in[N_OUT];
@@ -277,7 +295,7 @@ defproc FCLayer (chan?(math::fixpoint<8,8>) x_in[N_IN],
   math::fixpoint<8,8> x[N_IN], wf[N_OUT*N_IN], bf[N_OUT];
   math::fixpoint<8,8> acc[N_OUT];
   chan(math::fixpoint<8,8>) raw[N_OUT];
-
+  int<32> fc_iter, fc_hs;
   Activation<ACT_FN, LEAK> act[N_OUT];
 
   (j: N_OUT:
@@ -292,17 +310,26 @@ defproc FCLayer (chan?(math::fixpoint<8,8>) x_in[N_IN],
       )
     );
     (;j: N_OUT: b_in[j]?bf[j]);
-
+    [ PERF_MODE=1 -> fc_iter:=0; fc_hs:=0; log("PERF_INIT:FCLayer") [] else -> skip ];
     *[
+      
+      [ PERF_MODE=1 -> [ fc_iter % 5 = 0 -> log("PERF:FCLayer_RX_START:iter=", fc_iter) [] 
+      else -> skip ] [] else -> skip ];
       (;i: N_IN: x_in[i]?x[i]);
-
+      [ PERF_MODE=1 -> [ fc_iter % 5 = 0 -> log("PERF:FCLayer_RX_END:iter=", fc_iter) [] 
+      else -> skip ] [] else -> skip ];
+      
       (,j: N_OUT:
         acc[j] := bf[j];
         (;i: N_IN:
           acc[j] := acc[j] + wf[j*N_IN + i] * x[i]
         );
         raw[j]!acc[j]
-      )
+      );
+      fc_hs := fc_hs + 1;
+      fc_iter := fc_iter + 1;
+      [ PERF_MODE=1 -> [ fc_iter % 5 = 0 -> log("PERF:FCLayer_DONE:iter=", fc_iter) [] 
+      else -> skip ] [] else -> skip ]
     ]
   }
 }
@@ -359,7 +386,7 @@ defproc ConvLayerParamSource (chan!(math::fixpoint<8,8>) w_out[N_OUT*N_IN_CH*K*K
   outputs.
 ---------------------------------------------------------------- */
 
-template<pint K, N_IN_CH, N_OUT>
+template<pint K, N_IN_CH, N_OUT, PERF_MODE=0>
 defproc ConvBank (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K],
                                                 w_in[N_OUT*N_IN_CH*K*K],
                                                 b_in[N_OUT];
@@ -368,7 +395,7 @@ defproc ConvBank (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K],
   math::fixpoint<8,8> vx[N_OUT][N_IN_CH][K*K];
   math::fixpoint<8,8> wf[N_OUT*N_IN_CH*K*K], bf[N_OUT];
   math::fixpoint<8,8> acc[N_OUT];
-
+  int<32> cb_iter, cb_hs;
   chp {
     (;f: N_OUT:
       (;ch: N_IN_CH:
@@ -379,8 +406,10 @@ defproc ConvBank (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K],
       )
     );
     (;f: N_OUT: b_in[f]?bf[f]);
-
+    [ PERF_MODE=1 -> cb_iter:=0; cb_hs:=0; log("PERF_INIT:CB") [] else -> skip ];
     *[
+      [ PERF_MODE=1 -> [ cb_iter % 5 = 0 -> log("PERF:CB_RX_START:iter=", cb_iter) [] 
+      else -> skip ] [] else -> skip ];
       (;f: N_OUT:
         (;ch: N_IN_CH:
           (;k: K*K:
@@ -388,7 +417,8 @@ defproc ConvBank (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K],
           )
         )
       );
-
+      [ PERF_MODE=1 -> [ cb_iter % 5 = 0 -> log("PERF:CB_RX_END:iter=", cb_iter) [] 
+      else -> skip ] [] else -> skip ];
       (,f: N_OUT:
         acc[f] := bf[f];
         (;ch: N_IN_CH:
@@ -398,7 +428,11 @@ defproc ConvBank (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K],
           )
         );
         out[f]!acc[f]
-      )
+      );
+      cb_hs := cb_hs + 1;
+      cb_iter := cb_iter + 1;
+      [ PERF_MODE=1 -> [ cb_iter % 5 = 0 -> log("PERF:CB_DONE:iter=", cb_iter) [] 
+      else -> skip ] [] else -> skip ]
     ]
   }
 }
@@ -412,7 +446,7 @@ defproc ConvBank (chan?(math::fixpoint<8,8>) win[N_OUT][N_IN_CH][K*K],
   Activation are all instantiated directly inside this layer.
 ---------------------------------------------------------------- */
 
-template<pint IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN; preal LEAK>
+template<pint IMG_W, IMG_H, K, N_IN_CH, N_OUT, ACT_FN, PERF_MODE=0; preal LEAK>
 defproc ConvLayer (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH],
                                                 w_in[N_OUT*N_IN_CH*K*K],
                                                 b_in[N_OUT];
@@ -423,7 +457,7 @@ defproc ConvLayer (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH],
   chan(math::fixpoint<8,8>) conv_in[N_OUT][N_IN_CH][K*K];
   chan(math::fixpoint<8,8>) raw[N_OUT];
 
-  WindowAssembler<IMG_W, IMG_H, K> wa[N_IN_CH];
+  WindowAssembler<IMG_W, IMG_H, K, PERF_MODE> wa[N_IN_CH];
   (ch: N_IN_CH:
     wa[ch].pix_in = pixel_in[ch];
     wa[ch].win[0..K*K-1] = raw_win[ch][0..K*K-1];
@@ -444,7 +478,7 @@ defproc ConvLayer (chan?(math::fixpoint<8,8>) pixel_in[N_IN_CH],
     )
   )
 
-  ConvBank<K, N_IN_CH, N_OUT> conv_bank;
+  ConvBank<K, N_IN_CH, N_OUT, PERF_MODE> conv_bank;
   conv_bank.win[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1] =
     conv_in[0..N_OUT-1][0..N_IN_CH-1][0..K*K-1];
   conv_bank.w_in[0..N_OUT*N_IN_CH*K*K-1] =

@@ -52,9 +52,7 @@ defproc XOR_ANN (chan?(math::fixpoint<8,8>) x1_in, x2_in;
                        0.0, 1.0 },
                      { -0.5, -0.5 }> input_params (input_w, input_b);
 
-  FCLayer<2, 2, 1, 0.0> input_layer (
-    x, input_w, input_b, b
-  );
+  FCLayer<2, 2, 1, 1, 0.0> input_layer (x, input_w, input_b, b);
 
   // Hidden threshold nodes:
   //   a1 = step( b1 + b2 - 1)
@@ -64,9 +62,7 @@ defproc XOR_ANN (chan?(math::fixpoint<8,8>) x1_in, x2_in;
                        -1.0, -1.0 },
                      { -1.0, 1.0 }> hidden_params (hidden_w, hidden_b);
 
-  FCLayer<2, 2, 1, 0.0> hidden_layer (
-    b, hidden_w, hidden_b, a
-  );
+  FCLayer<2, 2, 1, 1, 0.0> hidden_layer (b, hidden_w, hidden_b, a);
 
   // Output node:
   //   y = step(a1 + a2 - 2)
@@ -74,9 +70,7 @@ defproc XOR_ANN (chan?(math::fixpoint<8,8>) x1_in, x2_in;
                      { 1.0, 1.0 },
                      { -2.0 }> output_params (output_w, output_b);
 
-  FCLayer<2, 1, 1, 0.0> output_layer (
-    a, output_w, output_b, y
-  );
+  FCLayer<2, 1, 1, 1, 0.0> output_layer(a, output_w, output_b, y);
 }
 
 
@@ -89,36 +83,42 @@ defproc XOR_ANN_Testbench (chan!(math::fixpoint<8,8>) x1, x2;
 {
   math::fixpoint<8,8> zero, one, half, yv, diff;
   bool yb;
-
+  int<32> run, max_runs, input_idx;
   chp {
-    zero.set(zero.const(0.0));
-    one.set(one.const(1.0));
-    half.set(half.const(0.5));
-    log("start XOR_ANN_Testbench");
-    x1!zero; x2!zero;
+  zero.set(zero.const(0.0));
+  one.set(one.const(1.0));
+  half.set(half.const(0.5));
+  log("start XOR_ANN_Testbench");
+  
+  max_runs := 10;  // Run each XOR input 10 times for steady-state
+  
+  // Test all 4 XOR inputs, repeated max_runs times
+  *[ run < (2 * max_runs + 1) ->
+    input_idx := run % 4;
+    
+    // Drive inputs based on input_idx
+    [ input_idx = 0 -> x1!zero; x2!zero
+    [] input_idx = 1 -> x1!zero; x2!one
+    [] input_idx = 2 -> x1!one; x2!zero
+    [] else -> x1!one; x2!one
+    ];
+    
     y?yv;
     diff := yv - half;
     [ ~diff.negative() -> yb := true [] else -> yb := false ];
-    log("xor(0,0) = ", yb);
-
-    x1!zero; x2!one;
-    y?yv;
-    diff := yv - half;
-    [ ~diff.negative() -> yb := true [] else -> yb := false ];
-    log("xor(0,1) = ", yb);
-
-    x1!one; x2!zero;
-    y?yv;
-    diff := yv - half;
-    [ ~diff.negative() -> yb := true [] else -> yb := false ];
-    log("xor(1,0) = ", yb);
-
-    x1!one; x2!one;
-    y?yv;
-    diff := yv - half;
-    [ ~diff.negative() -> yb := true [] else -> yb := false ];
-    log("xor(1,1) = ", yb)
-  }
+    
+    // Log every 10th iteration (steady-state sample)
+    [ (run % 5) = 0 ->
+      log("XOR_RUN:", run, "| input=", input_idx, "| output=", yb);
+      log("")
+    [] else -> skip
+    ];
+    
+    run := run + 1
+  ];
+  
+  log("XOR_TEST_DONE: total_runs=", run)
+}
 }
 
 
